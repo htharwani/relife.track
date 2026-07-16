@@ -2,7 +2,7 @@ import cv2
 import uuid
 from config.config_manager import ConfigManager
 from database.postgres_client import PostgresClient
-from faiss.vector_store import VectorStore
+from vector_db.vector_store import VectorStore
 from camera.stream import CameraStream
 from detector.hailo_yolo import HailoYOLODetector
 from tracker.byte_tracker import ByteTrackerWrapper
