@@ -80,42 +80,39 @@ class HailoYOLODetector:
             
             # Dynamically inspect outputs to find the bounding boxes tensor
             for out_name, out_data in infer_results.items():
-                arr = np.array(out_data)
                 
-                # Squeeze batch dimension if present
-                if len(arr.shape) > 0 and arr.shape[0] == 1:
-                    arr = arr[0]
-                    
-                # Look for a tensor that resembles [N, 5] or [N, 6]
-                if len(arr.shape) == 2 and arr.shape[1] >= 4:
-                    for row in arr:
-                        if len(row) >= 5:
-                            ymin, xmin, ymax, xmax, score = row[:5]
-                            class_id = int(row[5]) if len(row) > 5 else 0
-                        else:
-                            ymin, xmin, ymax, xmax = row[:4]
-                            score = 1.0
-                            class_id = 0
-                            
-                        # If coordinates are 0, it's usually padding in Hailo NMS
-                        if score < self.conf_threshold or (ymin == 0 and xmin == 0 and ymax == 0 and xmax == 0):
-                            continue
-                            
-                        # Coordinates might be absolute or normalized
-                        x1 = int(xmin * w) if xmin <= 1.0 else int(xmin * (w / input_w))
-                        y1 = int(ymin * h) if ymin <= 1.0 else int(ymin * (h / input_h))
-                        x2 = int(xmax * w) if xmax <= 1.0 else int(xmax * (w / input_w))
-                        y2 = int(ymax * h) if ymax <= 1.0 else int(ymax * (h / input_h))
+                # Hailo NMS output format: [batch][class_id][box_index][ymin, xmin, ymax, xmax, score]
+                if isinstance(out_data, list) and len(out_data) > 0:
+                    batch_data = out_data[0]
+                    if isinstance(batch_data, list):
+                        is_nms_format = False
+                        for class_id, class_boxes in enumerate(batch_data):
+                            if isinstance(class_boxes, list) or isinstance(class_boxes, np.ndarray):
+                                is_nms_format = True
+                                for box in class_boxes:
+                                    if len(box) >= 5:
+                                        ymin, xmin, ymax, xmax, score = box[:5]
+                                        
+                                        if score < self.conf_threshold:
+                                            continue
+                                            
+                                        x1 = int(xmin * w) if xmin <= 1.0 else int(xmin * (w / input_w))
+                                        y1 = int(ymin * h) if ymin <= 1.0 else int(ymin * (h / input_h))
+                                        x2 = int(xmax * w) if xmax <= 1.0 else int(xmax * (w / input_w))
+                                        y2 = int(ymax * h) if ymax <= 1.0 else int(ymax * (h / input_h))
+                                        
+                                        boxes.append([x1, y1, x2, y2, score, class_id])
                         
-                        boxes.append([x1, y1, x2, y2, score, class_id])
-                    break # Successfully found and parsed the boxes tensor
+                        # If we confirmed it's the nested NMS format (e.g. 80 classes), stop searching
+                        if is_nms_format or len(batch_data) == 80:
+                            break
+                            
             else:
-                shapes = {k: np.array(v).shape for k, v in infer_results.items()}
-                logger.warning(f"Could not find valid bounding box tensor. Available outputs: {shapes}")
+                shapes = {k: type(v) for k, v in infer_results.items()}
+                logger.warning(f"Could not find valid bounding box structure. Available outputs: {shapes}")
                 
         except Exception as e:
-            out_types = {k: type(v) for k, v in infer_results.items()}
-            logger.error(f"Error decoding YOLO output: {e}. Available types: {out_types}")
+            logger.error(f"Error decoding YOLO output: {e}")
             
         return np.array(boxes) if boxes else np.empty((0, 6))
 
