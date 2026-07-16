@@ -13,22 +13,48 @@ class TrackedObject:
 
 class ByteTrackerWrapper:
     def __init__(self, track_thresh=0.5, track_buffer=30, match_thresh=0.8, frame_rate=30):
-        logger.info("Initializing ByteTrack")
+        logger.info("Initializing Simple Centroid Tracker (ByteTrack fallback)")
         self.track_thresh = track_thresh
-        self.track_buffer = track_buffer
-        self.match_thresh = match_thresh
-        self.frame_rate = frame_rate
-        # self.tracker = BYTETracker(...) # Real ByteTrack initialization
+        self.next_id = 1
+        self.active_tracks = {} # id: centroid (x, y)
+
+    def _get_centroid(self, box):
+        return ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
 
     def update(self, output_results, img_info, img_size):
-        """
-        Updates the tracker with new detections.
-        output_results: numpy array of shape (N, 6) -> [x1, y1, x2, y2, score, class_id]
-        """
-        # Simulated tracking output
         online_targets = []
+        if len(output_results) == 0:
+            return online_targets
+            
+        current_centroids = []
+        current_boxes = []
         
-        # Real ByteTrack usage:
-        # online_targets = self.tracker.update(output_results, img_info, img_size)
-        
+        for box in output_results:
+            if box[4] > self.track_thresh:
+                current_centroids.append(self._get_centroid(box))
+                current_boxes.append(box[:4])
+                
+        if not current_centroids:
+            return online_targets
+            
+        new_tracks = {}
+        for i, centroid in enumerate(current_centroids):
+            best_id = None
+            best_dist = float('inf')
+            
+            for track_id, prev_centroid in self.active_tracks.items():
+                dist = np.sqrt((centroid[0] - prev_centroid[0])**2 + (centroid[1] - prev_centroid[1])**2)
+                if dist < 100 and dist < best_dist: # 100 pixel max distance
+                    best_dist = dist
+                    best_id = track_id
+                    
+            if best_id is not None:
+                new_tracks[best_id] = centroid
+                online_targets.append(TrackedObject(best_id, current_boxes[i]))
+            else:
+                new_tracks[self.next_id] = centroid
+                online_targets.append(TrackedObject(self.next_id, current_boxes[i]))
+                self.next_id += 1
+                
+        self.active_tracks = new_tracks
         return online_targets

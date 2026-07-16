@@ -51,7 +51,11 @@ class HailoYOLODetector:
             return np.empty((0, 6))
             
         # 1. Preprocessing
-        input_h, input_w = self.input_shape[1], self.input_shape[2]
+        if len(self.input_shape) == 4:
+            input_h, input_w = self.input_shape[1], self.input_shape[2]
+        else:
+            input_h, input_w = self.input_shape[0], self.input_shape[1]
+            
         resized = cv2.resize(frame, (input_w, input_h))
         # Ensure array is contiguous and formatted as expected by Hailo
         input_data = {self.input_name: np.expand_dims(resized, axis=0).astype(np.float32)}
