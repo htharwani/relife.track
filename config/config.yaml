@@ -1,0 +1,23 @@
+camera:
+  resolution_width: 640
+  resolution_height: 640
+  framerate: 30
+
+pipeline:
+  yolo_threshold: 0.4
+  face_threshold: 0.5
+  reid_threshold: 0.5
+  faiss_similarity_threshold: 0.7
+
+database:
+  host: "localhost"
+  port: 5432
+  user: "postgres"
+  password: "password"
+  dbname: "person_counter"
+
+models:
+  yolo: ""
+  scrfd: ""
+  arcface: ""
+  reid: ""

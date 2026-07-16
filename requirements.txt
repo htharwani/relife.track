@@ -1,0 +1,11 @@
+hailo==1.0.0
+psycopg2-binary==2.9.9
+faiss-cpu==1.7.4
+numpy==1.26.4
+opencv-python==4.9.0.80
+pyyaml==6.0.1
+lap==0.4.0
+cython_bbox==0.1.5
+scipy==1.12.0
+# ByteTrack dependencies (sometimes need manual install or are embedded)
+# loguru==0.7.2
