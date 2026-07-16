@@ -1,6 +1,7 @@
 import numpy as np
 import cv2
 from utils.logger import logger
+from contextlib import ExitStack
 
 class HailoYOLODetector:
     def __init__(self, hef_path, conf_threshold=0.4):
@@ -33,7 +34,16 @@ class HailoYOLODetector:
         self.input_vstreams_params = InputVStreamParams.make_from_network_group(self.network_group, quantized=False, format_type=FormatType.FLOAT32)
         self.output_vstreams_params = OutputVStreamParams.make_from_network_group(self.network_group, quantized=False, format_type=FormatType.FLOAT32)
         
-        self.infer_pipeline = InferVStreams(self.network_group, self.input_vstreams_params, self.output_vstreams_params)
+        # Set up persistent context for Network Group and InferVStreams
+        self.exit_stack = ExitStack()
+        
+        # Activate network group
+        self.activated_network_group = self.network_group.activate(self.network_group_params)
+        self.exit_stack.enter_context(self.activated_network_group)
+        
+        # Create and enter InferVStreams context
+        infer_pipeline_ctx = InferVStreams(self.network_group, self.input_vstreams_params, self.output_vstreams_params)
+        self.infer_pipeline = self.exit_stack.enter_context(infer_pipeline_ctx)
         
         # Get input shape info (usually 640x640)
         self.input_vstream_info = self.hef.get_input_vstream_infos()[0]
@@ -61,8 +71,7 @@ class HailoYOLODetector:
         input_data = {self.input_name: np.expand_dims(resized, axis=0).astype(np.float32)}
         
         # 2. Inference
-        with self.infer_pipeline as pipeline:
-            infer_results = pipeline.infer(input_data)
+        infer_results = self.infer_pipeline.infer(input_data)
             
         # 3. Postprocessing
         boxes = []
@@ -101,5 +110,7 @@ class HailoYOLODetector:
         return np.array(boxes) if boxes else np.empty((0, 6))
 
     def __del__(self):
+        if hasattr(self, 'exit_stack'):
+            self.exit_stack.close()
         if hasattr(self, 'target'):
             self.target.release()
