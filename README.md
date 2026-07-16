@@ -27,7 +27,7 @@ sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'password';"
 
 3. **Install Python Packages**
 ```bash
-python3 -m venv venv
+python3 -m venv venv --system-site-packages
 source venv/bin/activate
 pip install -r requirements.txt
 ```

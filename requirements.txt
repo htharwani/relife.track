@@ -1,4 +1,3 @@
-hailo==1.0.0
 psycopg2-binary==2.9.9
 faiss-cpu==1.7.4
 numpy==1.26.4
