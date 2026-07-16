@@ -15,7 +15,8 @@ class HailoYOLODetector:
             raise ValueError("HEF path for YOLO is empty.")
             
         try:
-            from hailo_platform import HEF, VDevice, HailoStreamInterface, ConfigureParams, InputVStreamParams, OutputVStreamParams, InferVStreams
+            from hailo_platform import (HEF, VDevice, HailoStreamInterface, ConfigureParams, 
+                                      InputVStreamParams, OutputVStreamParams, InferVStreams, FormatType)
         except ImportError:
             logger.error("hailo_platform is not installed. Please install HailoRT Python API.")
             return
@@ -28,9 +29,9 @@ class HailoYOLODetector:
         self.network_group = self.network_groups[0]
         self.network_group_params = self.network_group.create_params()
         
-        # Create input and output stream parameters
-        self.input_vstreams_params = InputVStreamParams.make_from_network_group(self.network_group, quantized=False, format_type=1)
-        self.output_vstreams_params = OutputVStreamParams.make_from_network_group(self.network_group, quantized=False, format_type=1)
+        # Create input and output stream parameters using proper FormatType Enum
+        self.input_vstreams_params = InputVStreamParams.make_from_network_group(self.network_group, quantized=False, format_type=FormatType.FLOAT32)
+        self.output_vstreams_params = OutputVStreamParams.make_from_network_group(self.network_group, quantized=False, format_type=FormatType.FLOAT32)
         
         self.infer_pipeline = InferVStreams(self.network_group, self.input_vstreams_params, self.output_vstreams_params)
         
