@@ -112,6 +112,24 @@ class UniquePersonCounter:
                         self.db.update_live_track(track_id, visitor_uuid)
                     self.active_tracks[track_id] = visitor_uuid
 
+                # Visualization: Draw bounding boxes and IDs
+                for track in tracked_objects:
+                    x1, y1, x2, y2 = map(int, track.tlbr)
+                    track_id = track.track_id
+                    visitor_uuid = self.active_tracks.get(track_id, "Unknown")
+                    
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    label = f"ID: {track_id} | UUID: {str(visitor_uuid)[:8]}"
+                    cv2.putText(frame, label, (x1, max(0, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+                # Show the video stream window
+                cv2.imshow("Unique Person Counting", frame)
+                
+                # Exit loop if 'q' is pressed
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    logger.info("Quit signal received from video window.")
+                    break
+
                 # Cleanup stale DB tracks periodically
                 if self.use_db:
                     self.db.delete_stale_tracks()
