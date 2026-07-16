@@ -6,37 +6,47 @@ class CameraStream:
         self.width = config.get('resolution_width', 640)
         self.height = config.get('resolution_height', 640)
         self.framerate = config.get('framerate', 30)
-        self.cap = None
+        self.picam2 = None
 
     def start(self):
         """
-        Starts the libcamera GStreamer pipeline for Sony IMX500 on Raspberry Pi 5.
-        Uses libcamerasrc for native performance.
+        Starts the Picamera2 stream for Sony IMX500 on Raspberry Pi 5.
+        This bypasses OpenCV's backend, which lacks GStreamer support when installed via pip.
         """
-        gst_pipeline = (
-            f"libcamerasrc ! "
-            f"video/x-raw, width={self.width}, height={self.height}, framerate={self.framerate}/1 ! "
-            f"videoconvert ! appsink"
-        )
-        logger.info(f"Starting camera with pipeline: {gst_pipeline}")
-        
-        self.cap = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
-        
-        if not self.cap.isOpened():
-            logger.warning("GStreamer pipeline failed. Falling back to V4L2 (/dev/video0)")
-            self.cap = cv2.VideoCapture(0)
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-            self.cap.set(cv2.CAP_PROP_FPS, self.framerate)
+        try:
+            from picamera2 import Picamera2
+            logger.info("Initializing Picamera2...")
+            self.picam2 = Picamera2()
             
-            if not self.cap.isOpened():
-                raise RuntimeError("Could not open camera stream.")
+            # Configure the camera for video stream
+            config = self.picam2.create_video_configuration(main={"size": (self.width, self.height), "format": "RGB888"})
+            self.picam2.configure(config)
+            
+            self.picam2.start()
+            logger.info("Picamera2 stream started successfully.")
+            
+        except ImportError:
+            logger.error("Picamera2 is not installed or accessible. Cannot start camera.")
+            raise
+        except Exception as e:
+            logger.error(f"Failed to start Picamera2: {e}")
+            raise
 
     def read_frame(self):
-        if self.cap is None:
+        if self.picam2 is None:
             return False, None
-        return self.cap.read()
+        try:
+            # Capture the latest frame array from the continuous stream
+            frame_rgb = self.picam2.capture_array()
+            # Convert RGB to BGR for OpenCV
+            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            return True, frame_bgr
+        except Exception as e:
+            logger.error(f"Error reading frame from Picamera2: {e}")
+            return False, None
 
     def stop(self):
-        if self.cap:
-            self.cap.release()
+        if self.picam2:
+            self.picam2.stop()
+            self.picam2.close()
+            logger.info("Picamera2 stopped.")
