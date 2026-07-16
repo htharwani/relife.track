@@ -76,36 +76,46 @@ class HailoYOLODetector:
         # 3. Postprocessing
         boxes = []
         try:
-            # Note: The output format heavily depends on whether your HEF includes NMS.
-            # Assuming it includes NMS and outputs a single tensor of bounding boxes.
-            output_name = list(infer_results.keys())[0]
-            raw_output = infer_results[output_name][0]
-            
             h, w = frame.shape[:2]
             
-            # Simple decoder assuming [ymin, xmin, ymax, xmax, score, class_id] normalized between 0-1
-            if len(raw_output.shape) == 2 and raw_output.shape[1] >= 5:
-                for row in raw_output:
-                    ymin, xmin, ymax, xmax, score = row[:5]
+            # Dynamically inspect outputs to find the bounding boxes tensor
+            for out_name, out_data in infer_results.items():
+                arr = np.array(out_data)
+                
+                # Squeeze batch dimension if present
+                if len(arr.shape) > 0 and arr.shape[0] == 1:
+                    arr = arr[0]
                     
-                    if score < self.conf_threshold:
-                        continue
+                # Look for a tensor that resembles [N, 5] or [N, 6]
+                if len(arr.shape) == 2 and arr.shape[1] >= 4:
+                    for row in arr:
+                        if len(row) >= 5:
+                            ymin, xmin, ymax, xmax, score = row[:5]
+                            class_id = int(row[5]) if len(row) > 5 else 0
+                        else:
+                            ymin, xmin, ymax, xmax = row[:4]
+                            score = 1.0
+                            class_id = 0
+                            
+                        # If coordinates are 0, it's usually padding in Hailo NMS
+                        if score < self.conf_threshold or (ymin == 0 and xmin == 0 and ymax == 0 and xmax == 0):
+                            continue
+                            
+                        # Coordinates might be absolute or normalized
+                        x1 = int(xmin * w) if xmin <= 1.0 else int(xmin * (w / input_w))
+                        y1 = int(ymin * h) if ymin <= 1.0 else int(ymin * (h / input_h))
+                        x2 = int(xmax * w) if xmax <= 1.0 else int(xmax * (w / input_w))
+                        y2 = int(ymax * h) if ymax <= 1.0 else int(ymax * (h / input_h))
                         
-                    # Some Hailo models output absolute coords, some normalized.
-                    # We assume normalized here. If absolute, remove the `* w` and `* h`.
-                    x1 = int(xmin * w) if xmin <= 1.0 else int(xmin * (w / input_w))
-                    y1 = int(ymin * h) if ymin <= 1.0 else int(ymin * (h / input_h))
-                    x2 = int(xmax * w) if xmax <= 1.0 else int(xmax * (w / input_w))
-                    y2 = int(ymax * h) if ymax <= 1.0 else int(ymax * (h / input_h))
-                    class_id = int(row[5]) if len(row) > 5 else 0
-                    
-                    boxes.append([x1, y1, x2, y2, score, class_id])
+                        boxes.append([x1, y1, x2, y2, score, class_id])
+                    break # Successfully found and parsed the boxes tensor
             else:
-                # If the shape is completely different, you need custom NMS logic here.
-                pass
+                shapes = {k: np.array(v).shape for k, v in infer_results.items()}
+                logger.warning(f"Could not find valid bounding box tensor. Available outputs: {shapes}")
                 
         except Exception as e:
-            logger.error(f"Error decoding YOLO output: {e}")
+            out_types = {k: type(v) for k, v in infer_results.items()}
+            logger.error(f"Error decoding YOLO output: {e}. Available types: {out_types}")
             
         return np.array(boxes) if boxes else np.empty((0, 6))
 
