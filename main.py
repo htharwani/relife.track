@@ -1,5 +1,6 @@
 import cv2
 import uuid
+import numpy as np
 from datetime import datetime
 from config.config_manager import ConfigManager
 from database.postgres_client import PostgresClient
@@ -106,6 +107,9 @@ class UniquePersonCounter:
         
         # ReID body cache (visitor_uuid: last_reid_embedding)
         self.reid_history = {}
+        
+        # Maps UUID to a stable ID for displaying
+        self.uuid_to_stable_id = {}
 
     def run(self):
         # Start MJPEG HTTP server thread
@@ -199,20 +203,29 @@ class UniquePersonCounter:
                             thresh = self.config['pipeline']['faiss_similarity_threshold']
                             matched_uuid, score = self.faiss.search(embedding, threshold=thresh)
                             logger.info(f"Upgrade FAISS search for track {track_id}: score = {score:.4f} (Threshold: {thresh})")
+                            
+                            old_display_id = self.uuid_to_stable_id.get(visitor_uuid, track_id)
                             if not matched_uuid:
                                 # New face visitor: register permanently (FAISS + DB)
-                                visitor_uuid = uuid.uuid4()
-                                self.faiss.add_embedding(embedding, visitor_uuid)
+                                new_uuid = uuid.uuid4()
+                                self.faiss.add_embedding(embedding, new_uuid)
                                 if self.use_db:
-                                    self.db.insert_visitor(visitor_uuid, "face")
-                                logger.info(f"Upgraded track {track_id} to new face: {visitor_uuid}")
+                                    self.db.insert_visitor(new_uuid, "face")
+                                logger.info(f"Upgraded track {track_id} to new face: {new_uuid}")
+                                self.uuid_to_stable_id[new_uuid] = old_display_id
+                                visitor_uuid = new_uuid
                             else:
+                                logger.info(f"Upgraded track {track_id} to existing face: {matched_uuid}")
+                                self.uuid_to_stable_id[matched_uuid] = old_display_id
                                 visitor_uuid = matched_uuid
-                                logger.info(f"Upgraded track {track_id} to existing face: {visitor_uuid}")
                                 
                             self.active_tracks[track_id] = visitor_uuid
                             self.tracks_with_face.add(track_id)
                             self.unique_visitors.add(visitor_uuid)
+                            
+                        # Register initial stable display ID if not present
+                        if visitor_uuid not in self.uuid_to_stable_id:
+                            self.uuid_to_stable_id[visitor_uuid] = track_id
                             
                         # Update ReID history with current crop to adapt to angle/light shifts
                         try:
@@ -266,10 +279,10 @@ class UniquePersonCounter:
                             
                             # Search face in FAISS
                             threshold = self.config['pipeline']['faiss_similarity_threshold']
-                            visitor_uuid, score = self.faiss.search(embedding, threshold=threshold)
+                            matched_uuid, score = self.faiss.search(embedding, threshold=threshold)
                             logger.info(f"New track FAISS search for track {track_id}: score = {score:.4f} (Threshold: {threshold})")
                             
-                            if not visitor_uuid:
+                            if not matched_uuid:
                                 # Register new face permanently
                                 visitor_uuid = uuid.uuid4()
                                 self.faiss.add_embedding(embedding, visitor_uuid)
@@ -277,6 +290,7 @@ class UniquePersonCounter:
                                     self.db.insert_visitor(visitor_uuid, "face")
                                 logger.info(f"New face visitor registered permanently: {visitor_uuid}")
                             else:
+                                visitor_uuid = matched_uuid
                                 logger.info(f"Existing face visitor recognized: {visitor_uuid} (Score: {score:.2f})")
                                 
                             self.unique_visitors.add(visitor_uuid)
@@ -295,6 +309,10 @@ class UniquePersonCounter:
                         except Exception as e:
                             logger.warning(f"Failed to extract initial ReID for track {track_id}: {e}")
 
+                    # Register display ID mapping
+                    if visitor_uuid not in self.uuid_to_stable_id:
+                        self.uuid_to_stable_id[visitor_uuid] = track_id
+
                     if self.use_db:
                         self.db.log_event(visitor_uuid, camera_id="imx500")
                         self.db.update_live_track(track_id, visitor_uuid)
@@ -306,14 +324,15 @@ class UniquePersonCounter:
                     x1, y1, x2, y2 = map(int, track.tlbr)
                     track_id = track.track_id
                     visitor_uuid = self.active_tracks.get(track_id, "Unknown")
+                    display_id = self.uuid_to_stable_id.get(visitor_uuid, track_id)
                     
                     # State Machine: Green (Verified Face) vs Red (Tracking Only)
                     if track_id in self.tracks_with_face or visitor_uuid in self.unique_visitors:
                         color = (0, 255, 0) # Green (BGR)
-                        label = f"ID: {track_id} | UUID: {str(visitor_uuid)[:8]} | Conf: {track.score:.2f}"
+                        label = f"ID: {display_id} | UUID: {str(visitor_uuid)[:8]} | Conf: {track.score:.2f}"
                     else:
                         color = (0, 0, 255) # Red (BGR)
-                        label = f"ID: {track_id} | Tracking | Conf: {track.score:.2f}"
+                        label = f"ID: {display_id} | Tracking | Conf: {track.score:.2f}"
                     
                     # Draw body box
                     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
