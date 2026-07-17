@@ -450,9 +450,10 @@ class UniquePersonCounter:
                                 best_reid_score = score
                                 best_reid_uuid = u
                                 
-                        if best_reid_score > 0.70:
+                        reid_thresh = self.config['pipeline'].get('reid_threshold', 0.65)
+                        if best_reid_score > reid_thresh:
                             visitor_uuid = best_reid_uuid
-                            logger.info(f"ReID Track Recovery for track {track_id}: matched with UUID {str(visitor_uuid)[:8]} (Score: {best_reid_score:.4f})")
+                            logger.info(f"ReID Track Recovery for track {track_id}: matched with UUID {str(visitor_uuid)[:8]} (Score: {best_reid_score:.4f}, Threshold: {reid_thresh})")
                             self.reid_history[visitor_uuid] = reid_emb  # update cache
                     except Exception as e:
                         logger.warning(f"ReID recovery check failed for track {track_id}: {e}")
