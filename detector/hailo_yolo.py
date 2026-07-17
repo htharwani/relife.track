@@ -58,8 +58,8 @@ class HailoYOLODetector:
             return np.empty((0, 6))
             
         # 1. Preprocessing
-        input_h = self.input_shape.height
-        input_w = self.input_shape.width
+        input_h = self.input_shape[0]
+        input_w = self.input_shape[1]
             
         resized = cv2.resize(frame, (input_w, input_h))
         # Ensure array is contiguous and formatted as expected by Hailo

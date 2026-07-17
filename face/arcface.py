@@ -66,8 +66,8 @@ class ArcFaceExtractor:
 
         try:
             # 1. Preprocessing
-            input_h = self.input_shape.height
-            input_w = self.input_shape.width
+            input_h = self.input_shape[0]
+            input_w = self.input_shape[1]
             resized = cv2.resize(face_crop, (input_w, input_h))
             input_data = {self.input_name: np.expand_dims(resized, axis=0).astype(np.float32)}
             
