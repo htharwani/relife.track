@@ -39,6 +39,7 @@ class UniquePersonCounter:
         
         # State tracking
         self.active_tracks = {} # track_id: visitor_uuid
+        self.unique_visitors = set() # set of unique visitor_uuids seen in this session
 
     def run(self):
         self.camera.start()
@@ -67,6 +68,7 @@ class UniquePersonCounter:
                         if self.use_db:
                             self.db.update_live_track(track_id, visitor_uuid)
                             self.db.update_visitor_last_seen(visitor_uuid)
+                        self.unique_visitors.add(visitor_uuid)
                         continue
                         
                     # NEW Track detected -> we need to extract embedding
@@ -111,6 +113,7 @@ class UniquePersonCounter:
                         self.db.log_event(visitor_uuid, camera_id="imx500")
                         self.db.update_live_track(track_id, visitor_uuid)
                     self.active_tracks[track_id] = visitor_uuid
+                    self.unique_visitors.add(visitor_uuid)
 
                 # Visualization: Draw bounding boxes and IDs
                 for track in tracked_objects:
@@ -121,6 +124,16 @@ class UniquePersonCounter:
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                     label = f"ID: {track_id} | UUID: {str(visitor_uuid)[:8]}"
                     cv2.putText(frame, label, (x1, max(0, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+                # Premium semi-transparent overlay dashboard at the top-left of the stream
+                overlay = frame.copy()
+                cv2.rectangle(overlay, (10, 10), (320, 85), (0, 0, 0), -1)
+                alpha = 0.65  # Transparency factor
+                cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+
+                # Draw the unique visitor metrics text on top of the overlay
+                cv2.putText(frame, f"Unique (Session): {len(self.unique_visitors)}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(frame, f"Total Registered: {len(self.faiss.uuid_mapping)}", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
                 # Show the video stream window
                 cv2.imshow("Unique Person Counting", frame)
