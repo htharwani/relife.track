@@ -280,8 +280,8 @@ class UniquePersonCounter:
                         fw = fx2 - fx1
                         fh = fy2 - fy1
                         
-                        # Only accept high-confidence, clear face detections (conf >= 0.72, size >= 24px)
-                        if face_score >= 0.72 and fw >= 24 and fh >= 24:
+                        # Only accept clear face detections (conf >= 0.55, size >= 24px)
+                        if face_score >= 0.55 and fw >= 24 and fh >= 24:
                             is_valid_face = True
                             logger.info(f"Valid face detected for Track {track_id}: score = {face_score:.2f}, size = {fw}x{fh}")
                         else:
@@ -404,8 +404,8 @@ class UniquePersonCounter:
                         fw = fx2 - fx1
                         fh = fy2 - fy1
                         
-                        # Only accept high-confidence, clear face detections (conf >= 0.72, size >= 24px)
-                        if face_score >= 0.72 and fw >= 24 and fh >= 24:
+                        # Only accept clear face detections (conf >= 0.55, size >= 24px)
+                        if face_score >= 0.55 and fw >= 24 and fh >= 24:
                             is_valid_face = True
                             logger.info(f"Valid face detected for Track {track_id}: score = {face_score:.2f}, size = {fw}x{fh}")
                         else:
