@@ -44,27 +44,19 @@ class SCRFDDetector:
             self.input_vstreams_params = InputVStreamParams.make_from_network_group(self.network_group, quantized=False, format_type=FormatType.FLOAT32)
             self.output_vstreams_params = OutputVStreamParams.make_from_network_group(self.network_group, quantized=False, format_type=FormatType.FLOAT32)
             
-            # Set up contexts
-            self.exit_stack = ExitStack()
-            self.activated_network_group = self.network_group.activate(self.network_group_params)
-            self.exit_stack.enter_context(self.activated_network_group)
-            
-            infer_pipeline_ctx = InferVStreams(self.network_group, self.input_vstreams_params, self.output_vstreams_params)
-            self.infer_pipeline = self.exit_stack.enter_context(infer_pipeline_ctx)
-            
-            # Get input shape info
-            self.input_vstream_info = self.hef.get_input_vstream_infos()[0]
-            self.input_name = self.input_vstream_info.name
-            self.input_shape = self.input_vstream_info.shape
-            
-            # Get output stream info
-            self.output_vstream_infos = self.hef.get_output_vstream_infos()
-            logger.info(f"SCRFD Model loaded successfully on Hailo. Input shape: {self.input_shape}")
-            
-            self.is_mock = False
-        except Exception as e:
-            logger.error(f"Error loading SCRFD HEF model: {e}. Falling back to simulation mode.")
-            self.is_mock = True
+        # Get input shape info
+        self.input_vstream_info = self.hef.get_input_vstream_infos()[0]
+        self.input_name = self.input_vstream_info.name
+        self.input_shape = self.input_vstream_info.shape
+        
+        # Get output stream info
+        self.output_vstream_infos = self.hef.get_output_vstream_infos()
+        logger.info(f"SCRFD Model loaded successfully on Hailo. Input shape: {self.input_shape}")
+        
+        self.is_mock = False
+    except Exception as e:
+        logger.error(f"Error loading SCRFD HEF model: {e}. Falling back to simulation mode.")
+        self.is_mock = True
 
     def detect(self, img_crop, simulate=True):
         """
@@ -83,8 +75,11 @@ class SCRFDDetector:
             resized = cv2.resize(img_crop, (input_w, input_h))
             input_data = {self.input_name: np.expand_dims(resized, axis=0).astype(np.float32)}
             
-            # 2. Inference
-            infer_results = self.infer_pipeline.infer(input_data)
+            # 2. Inference (dynamic activation)
+            from hailo_platform import InferVStreams
+            with self.network_group.activate(self.network_group_params):
+                with InferVStreams(self.network_group, self.input_vstreams_params, self.output_vstreams_params) as infer_pipeline:
+                    infer_results = infer_pipeline.infer(input_data)
             
             # 3. Postprocessing (decoding outputs dynamically)
             strides = [8, 16, 32]

@@ -42,17 +42,6 @@ class HailoYOLODetector:
         self.input_vstreams_params = InputVStreamParams.make_from_network_group(self.network_group, quantized=False, format_type=FormatType.FLOAT32)
         self.output_vstreams_params = OutputVStreamParams.make_from_network_group(self.network_group, quantized=False, format_type=FormatType.FLOAT32)
         
-        # Set up persistent context for Network Group and InferVStreams
-        self.exit_stack = ExitStack()
-        
-        # Activate network group
-        self.activated_network_group = self.network_group.activate(self.network_group_params)
-        self.exit_stack.enter_context(self.activated_network_group)
-        
-        # Create and enter InferVStreams context
-        infer_pipeline_ctx = InferVStreams(self.network_group, self.input_vstreams_params, self.output_vstreams_params)
-        self.infer_pipeline = self.exit_stack.enter_context(infer_pipeline_ctx)
-        
         # Get input shape info (usually 640x640)
         self.input_vstream_info = self.hef.get_input_vstream_infos()[0]
         self.input_name = self.input_vstream_info.name
@@ -65,7 +54,7 @@ class HailoYOLODetector:
         Runs inference on the frame and returns bounding boxes.
         Returns: numpy array of [x1, y1, x2, y2, score, class_id]
         """
-        if not hasattr(self, 'infer_pipeline'):
+        if not hasattr(self, 'network_group'):
             return np.empty((0, 6))
             
         # 1. Preprocessing
@@ -78,8 +67,15 @@ class HailoYOLODetector:
         # Ensure array is contiguous and formatted as expected by Hailo
         input_data = {self.input_name: np.expand_dims(resized, axis=0).astype(np.float32)}
         
-        # 2. Inference
-        infer_results = self.infer_pipeline.infer(input_data)
+        # 2. Inference (dynamic activation)
+        try:
+            from hailo_platform import InferVStreams
+            with self.network_group.activate(self.network_group_params):
+                with InferVStreams(self.network_group, self.input_vstreams_params, self.output_vstreams_params) as infer_pipeline:
+                    infer_results = infer_pipeline.infer(input_data)
+        except Exception as e:
+            logger.error(f"YOLO Inference failed: {e}")
+            return np.empty((0, 6))
             
         # 3. Postprocessing
         boxes = []
