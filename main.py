@@ -282,8 +282,20 @@ class UniquePersonCounter:
                         
                         # Only accept clear face detections (conf >= 0.55, size >= 24px)
                         if face_score >= 0.55 and fw >= 24 and fh >= 24:
-                            is_valid_face = True
-                            logger.info(f"Valid face detected for Track {track_id}: score = {face_score:.2f}, size = {fw}x{fh}")
+                            # Verify if it is a frontal/semi-frontal face by checking eye separation
+                            landmarks = face_info[5] if len(face_info) > 5 else []
+                            is_frontal = True
+                            if len(landmarks) >= 2:
+                                lx, _ = landmarks[0][:2]
+                                rx, _ = landmarks[1][:2]
+                                eye_dist = abs(lx - rx)
+                                if eye_dist < fw * 0.22:
+                                    is_frontal = False
+                                    logger.info(f"Face ignored for Track {track_id}: rejected as profile/side-view (eye distance = {eye_dist:.1f} < {fw*0.22:.1f})")
+                                    
+                            if is_frontal:
+                                is_valid_face = True
+                                logger.info(f"Valid face detected for Track {track_id}: score = {face_score:.2f}, size = {fw}x{fh}")
                         else:
                             logger.info(f"Face ignored for Track {track_id}: score = {face_score:.2f}, size = {fw}x{fh} (does not meet criteria)")
                             
@@ -410,8 +422,20 @@ class UniquePersonCounter:
                         
                         # Only accept clear face detections (conf >= 0.55, size >= 24px)
                         if face_score >= 0.55 and fw >= 24 and fh >= 24:
-                            is_valid_face = True
-                            logger.info(f"Valid face detected for Track {track_id}: score = {face_score:.2f}, size = {fw}x{fh}")
+                            # Verify if it is a frontal/semi-frontal face by checking eye separation
+                            landmarks = face_info[5] if len(face_info) > 5 else []
+                            is_frontal = True
+                            if len(landmarks) >= 2:
+                                lx, _ = landmarks[0][:2]
+                                rx, _ = landmarks[1][:2]
+                                eye_dist = abs(lx - rx)
+                                if eye_dist < fw * 0.22:
+                                    is_frontal = False
+                                    logger.info(f"Face ignored for Track {track_id}: rejected as profile/side-view (eye distance = {eye_dist:.1f} < {fw*0.22:.1f})")
+                                    
+                            if is_frontal:
+                                is_valid_face = True
+                                logger.info(f"Valid face detected for Track {track_id}: score = {face_score:.2f}, size = {fw}x{fh}")
                         else:
                             logger.info(f"Face ignored for Track {track_id}: score = {face_score:.2f}, size = {fw}x{fh} (does not meet criteria)")
                             
