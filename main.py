@@ -154,6 +154,9 @@ class UniquePersonCounter:
         
         # Bounding box smoothing cache
         self.smoothed_bboxes = {}
+        
+        # Tracks timestamps of when each visitor UUID was last active
+        self.reid_last_seen = {}
 
     def run(self):
         # Start MJPEG HTTP server thread
@@ -225,26 +228,33 @@ class UniquePersonCounter:
                 # Tracks active in the current frame
                 active_ids = set()
                 
+                # Split tracked_objects into existing tracks and new tracks
+                existing_tracks = []
+                new_tracks = []
                 for track in tracked_objects:
+                    if track.track_id in self.active_tracks:
+                        existing_tracks.append(track)
+                    else:
+                        new_tracks.append(track)
+
+                # Pass 1: Process existing active tracks first to mark them active
+                for track in existing_tracks:
                     track_id = track.track_id
                     active_ids.add(track_id)
-                    rx1, ry1, rx2, ry2 = map(int, track.tlbr)
                     
-                    # Temporal smoothing using Exponential Moving Average (EMA)
+                    rx1, ry1, rx2, ry2 = map(int, track.tlbr)
                     if track_id not in self.smoothed_bboxes:
                         self.smoothed_bboxes[track_id] = [rx1, ry1, rx2, ry2]
                     else:
                         old_box = self.smoothed_bboxes[track_id]
-                        alpha = 0.60  # Smoothing factor (0.6 is very smooth but responsive)
+                        alpha = 0.60
                         self.smoothed_bboxes[track_id] = [
                             int(alpha * rx1 + (1 - alpha) * old_box[0]),
                             int(alpha * ry1 + (1 - alpha) * old_box[1]),
                             int(alpha * rx2 + (1 - alpha) * old_box[2]),
                             int(alpha * ry2 + (1 - alpha) * old_box[3]),
                         ]
-                        
                     x1, y1, x2, y2 = self.smoothed_bboxes[track_id]
-                    # Safe clip to frame bounds
                     x1 = max(0, x1)
                     y1 = max(0, y1)
                     x2 = min(frame.shape[1], x2)
@@ -254,13 +264,11 @@ class UniquePersonCounter:
                     if person_crop.size == 0:
                         continue
                         
-                    # 3. Face Detection (always checked for visualization & late registration)
-                    # Only simulate face if the person is sitting up (top of box y1 is in the upper 55% of the frame)
+                    # Face detection
                     y_threshold = int(frame.shape[0] * 0.55)
                     can_have_face = (y1 < y_threshold)
                     faces = self.scrfd.detect(person_crop, simulate=(self.simulate_face and can_have_face))
                     
-                    # Validate face based on landmark visibility (require at least 4 visible landmarks)
                     is_valid_face = False
                     if faces:
                         face_info = faces[0]
@@ -271,10 +279,9 @@ class UniquePersonCounter:
                             if visible_count >= 4:
                                 is_valid_face = True
                         else:
-                            logger.info(f"Face detected for Track {track_id} (no landmark confidence info).")
-                            is_valid_face = True # Fallback for backward compatibility
-                    
-                    # Store global face box coordinates if face is valid
+                            logger.info(f"Face detected for Track {track_id} (no confidence info).")
+                            is_valid_face = True
+                            
                     if is_valid_face:
                         face_bbox = faces[0][:4]
                         fx1, fy1, fx2, fy2 = map(int, face_bbox)
@@ -286,64 +293,114 @@ class UniquePersonCounter:
                     else:
                         self.track_face_bbox.pop(track_id, None)
                         
-                    if track_id in self.active_tracks:
-                        # Existing track, retrieve mapped UUID
-                        visitor_uuid = self.active_tracks[track_id]
+                    visitor_uuid = self.active_tracks[track_id]
+                    
+                    # Upgrade track to face if face detected for the first time
+                    if is_valid_face and track_id not in self.tracks_with_face:
+                        face_bbox = faces[0][:4]
+                        fx1, fy1, fx2, fy2 = map(int, face_bbox)
+                        face_crop = person_crop[fy1:fy2, fx1:fx2]
+                        raw_embedding = self.arcface.extract(face_crop)
+                        embedding = normalize_embedding(raw_embedding)
                         
-                        # Upgrade track to a permanent face ID if a valid face was just detected for the first time
-                        if is_valid_face and track_id not in self.tracks_with_face:
-                            face_bbox = faces[0][:4]
-                            fx1, fy1, fx2, fy2 = map(int, face_bbox)
-                            face_crop = person_crop[fy1:fy2, fx1:fx2]
-                            raw_embedding = self.arcface.extract(face_crop)
-                            embedding = normalize_embedding(raw_embedding)
+                        thresh = self.config['pipeline']['faiss_similarity_threshold']
+                        matched_uuid, score = self.faiss.search(embedding, threshold=thresh)
+                        logger.info(f"Upgrade FAISS search for track {track_id}: score = {score:.4f} (Threshold: {thresh})")
+                        
+                        old_display_id = self.uuid_to_stable_id.get(visitor_uuid, track_id)
+                        if not matched_uuid:
+                            new_uuid = uuid.uuid4()
+                            self.faiss.add_embedding(embedding, new_uuid)
+                            if self.use_db:
+                                self.db.insert_visitor(new_uuid, "face")
+                            logger.info(f"Upgraded track {track_id} to new face: {new_uuid}")
+                            self.uuid_to_stable_id[new_uuid] = old_display_id
+                            visitor_uuid = new_uuid
+                        else:
+                            logger.info(f"Upgraded track {track_id} to existing face: {matched_uuid}")
+                            if matched_uuid not in self.uuid_to_stable_id:
+                                self.uuid_to_stable_id[matched_uuid] = old_display_id
+                            visitor_uuid = matched_uuid
                             
-                            # Search face in FAISS
-                            thresh = self.config['pipeline']['faiss_similarity_threshold']
-                            matched_uuid, score = self.faiss.search(embedding, threshold=thresh)
-                            logger.info(f"Upgrade FAISS search for track {track_id}: score = {score:.4f} (Threshold: {thresh})")
-                            
-                            old_display_id = self.uuid_to_stable_id.get(visitor_uuid, track_id)
-                            if not matched_uuid:
-                                # New face visitor: register permanently (FAISS + DB)
-                                new_uuid = uuid.uuid4()
-                                self.faiss.add_embedding(embedding, new_uuid)
-                                if self.use_db:
-                                    self.db.insert_visitor(new_uuid, "face")
-                                logger.info(f"Upgraded track {track_id} to new face: {new_uuid}")
-                                self.uuid_to_stable_id[new_uuid] = old_display_id
-                                visitor_uuid = new_uuid
-                            else:
-                                logger.info(f"Upgraded track {track_id} to existing face: {matched_uuid}")
-                                if matched_uuid not in self.uuid_to_stable_id:
-                                    self.uuid_to_stable_id[matched_uuid] = old_display_id
-                                visitor_uuid = matched_uuid
-                                
-                            self.active_tracks[track_id] = visitor_uuid
-                            self.tracks_with_face.add(track_id)
-                            self.unique_visitors.add(visitor_uuid)
-                            
-                        # Register initial stable display ID if not present
-                        if visitor_uuid not in self.uuid_to_stable_id:
-                            self.uuid_to_stable_id[visitor_uuid] = self.next_display_id
-                            self.next_display_id += 1
-                            
-                        # Update ReID history with current crop to adapt to angle/light shifts
-                        try:
-                            raw_reid = self.reid.extract(person_crop)
-                            reid_emb = normalize_embedding(raw_reid)
-                            self.reid_history[visitor_uuid] = reid_emb
-                        except Exception as e:
-                            logger.warning(f"Failed to update ReID history for track {track_id}: {e}")
-                            
-                        if self.use_db:
-                            self.db.update_live_track(track_id, visitor_uuid)
-                            self.db.update_visitor_last_seen(visitor_uuid)
-                        if track_id in self.tracks_with_face or visitor_uuid in self.unique_visitors:
-                            self.unique_visitors.add(visitor_uuid)
+                        self.active_tracks[track_id] = visitor_uuid
+                        self.tracks_with_face.add(track_id)
+                        self.unique_visitors.add(visitor_uuid)
+                        
+                    if visitor_uuid not in self.uuid_to_stable_id:
+                        self.uuid_to_stable_id[visitor_uuid] = self.next_display_id
+                        self.next_display_id += 1
+                        
+                    # Update ReID history
+                    try:
+                        raw_reid = self.reid.extract(person_crop)
+                        reid_emb = normalize_embedding(raw_reid)
+                        self.reid_history[visitor_uuid] = reid_emb
+                    except Exception as e:
+                        logger.warning(f"Failed to update ReID history for track {track_id}: {e}")
+                        
+                    # Mark profile active now
+                    self.reid_last_seen[visitor_uuid] = time.time()
+                    
+                    if self.use_db:
+                        self.db.update_live_track(track_id, visitor_uuid)
+                        self.db.update_visitor_last_seen(visitor_uuid)
+
+                # Pass 2: Process new tracks second
+                for track in new_tracks:
+                    track_id = track.track_id
+                    active_ids.add(track_id)
+                    
+                    rx1, ry1, rx2, ry2 = map(int, track.tlbr)
+                    if track_id not in self.smoothed_bboxes:
+                        self.smoothed_bboxes[track_id] = [rx1, ry1, rx2, ry2]
+                    else:
+                        old_box = self.smoothed_bboxes[track_id]
+                        alpha = 0.60
+                        self.smoothed_bboxes[track_id] = [
+                            int(alpha * rx1 + (1 - alpha) * old_box[0]),
+                            int(alpha * ry1 + (1 - alpha) * old_box[1]),
+                            int(alpha * rx2 + (1 - alpha) * old_box[2]),
+                            int(alpha * ry2 + (1 - alpha) * old_box[3]),
+                        ]
+                    x1, y1, x2, y2 = self.smoothed_bboxes[track_id]
+                    x1 = max(0, x1)
+                    y1 = max(0, y1)
+                    x2 = min(frame.shape[1], x2)
+                    y2 = min(frame.shape[0], y2)
+                    
+                    person_crop = frame[y1:y2, x1:x2]
+                    if person_crop.size == 0:
                         continue
                         
-                    # NEW Track detected: Search ReID history to see if we can recover identity first!
+                    # Face detection
+                    y_threshold = int(frame.shape[0] * 0.55)
+                    can_have_face = (y1 < y_threshold)
+                    faces = self.scrfd.detect(person_crop, simulate=(self.simulate_face and can_have_face))
+                    
+                    is_valid_face = False
+                    if faces:
+                        face_info = faces[0]
+                        if len(face_info) >= 6:
+                            landmarks = face_info[5]
+                            visible_count = sum(1 for kp in landmarks if len(kp) >= 3 and kp[2] > 0.5)
+                            logger.info(f"Face detected for Track {track_id}: {visible_count}/5 landmarks visible.")
+                            if visible_count >= 4:
+                                is_valid_face = True
+                        else:
+                            logger.info(f"Face detected for Track {track_id} (no confidence info).")
+                            is_valid_face = True
+                            
+                    if is_valid_face:
+                        face_bbox = faces[0][:4]
+                        fx1, fy1, fx2, fy2 = map(int, face_bbox)
+                        gx1 = max(0, x1 + fx1)
+                        gy1 = max(0, y1 + fy1)
+                        gx2 = min(frame.shape[1], x1 + fx2)
+                        gy2 = min(frame.shape[0], y1 + fy2)
+                        self.track_face_bbox[track_id] = (gx1, gy1, gx2, gy2)
+                    else:
+                        self.track_face_bbox.pop(track_id, None)
+                        
                     visitor_uuid = None
                     try:
                         raw_reid = self.reid.extract(person_crop)
@@ -351,12 +408,17 @@ class UniquePersonCounter:
                         
                         # Get currently active visitor UUIDs in the frame
                         active_uuids = set(self.active_tracks.values())
+                        now_time = time.time()
                         
                         best_reid_uuid = None
                         best_reid_score = -1.0
                         for u, cached_emb in self.reid_history.items():
                             if u in active_uuids:
                                 continue  # Skip people who are already active in the frame
+                            
+                            # Skip profiles that were last seen more than 15 seconds ago
+                            if now_time - self.reid_last_seen.get(u, 0) > 15.0:
+                                continue
                                 
                             score = np.dot(reid_emb, cached_emb)
                             if score > best_reid_score:
@@ -369,7 +431,7 @@ class UniquePersonCounter:
                             self.reid_history[visitor_uuid] = reid_emb  # update cache
                     except Exception as e:
                         logger.warning(f"ReID recovery check failed for track {track_id}: {e}")
-
+                        
                     # If not matched by ReID, process as truly new
                     if not visitor_uuid:
                         self.hourly_total_in += 1  # Truly new visitor entry
@@ -418,6 +480,8 @@ class UniquePersonCounter:
                     if visitor_uuid not in self.uuid_to_stable_id:
                         self.uuid_to_stable_id[visitor_uuid] = self.next_display_id
                         self.next_display_id += 1
+
+                    self.reid_last_seen[visitor_uuid] = time.time()
 
                     if self.use_db:
                         self.db.log_event(visitor_uuid, camera_id="imx500")
