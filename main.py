@@ -12,10 +12,51 @@ from reid.repvgg import RepVGGReID
 from utils.logger import logger
 from utils.normalization import normalize_embedding
 import argparse
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
+import time
+
+latest_frame = None
+frame_lock = threading.Lock()
+
+class StreamingHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        # Suppress request logging to avoid terminal clutter
+        return
+
+    def do_GET(self):
+        global latest_frame
+        if self.path == '/stream':
+            self.send_response(200)
+            self.send_header('Age', '0')
+            self.send_header('Cache-Control', 'no-cache, private')
+            self.send_header('Pragma', 'no-cache')
+            self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
+            self.end_headers()
+            try:
+                while True:
+                    with frame_lock:
+                        frame_data = latest_frame
+                    
+                    if frame_data is not None:
+                        self.wfile.write(b'--frame\r\n')
+                        self.send_header('Content-Type', 'image/jpeg')
+                        self.send_header('Content-Length', str(len(frame_data)))
+                        self.end_headers()
+                        self.wfile.write(frame_data)
+                        self.wfile.write(b'\r\n')
+                    
+                    time.sleep(0.03)  # ~30 FPS
+            except Exception:
+                pass
+        else:
+            self.send_response(404)
+            self.end_headers()
 
 class UniquePersonCounter:
-    def __init__(self, use_db=True):
+    def __init__(self, use_db=True, port=5000):
         self.use_db = use_db
+        self.stream_port = port
         self.config_manager = ConfigManager()
         self.config = self.config_manager.config
         
@@ -28,9 +69,13 @@ class UniquePersonCounter:
         
         # Init Models
         models_cfg = self.config['models']
-        self.detector = HailoYOLODetector(models_cfg['yolo'])
-        self.tracker = ByteTrackerWrapper()
-        self.scrfd = SCRFDDetector(models_cfg['scrfd'])
+        pipeline_cfg = self.config.get('pipeline', {})
+        yolo_thresh = pipeline_cfg.get('yolo_threshold', 0.4)
+        face_thresh = pipeline_cfg.get('face_threshold', 0.5)
+        
+        self.detector = HailoYOLODetector(models_cfg['yolo'], conf_threshold=yolo_thresh)
+        self.tracker = ByteTrackerWrapper(track_thresh=yolo_thresh)
+        self.scrfd = SCRFDDetector(models_cfg['scrfd'], conf_threshold=face_thresh)
         self.arcface = ArcFaceExtractor(models_cfg['arcface'])
         self.reid = RepVGGReID(models_cfg['reid'])
         
@@ -42,6 +87,15 @@ class UniquePersonCounter:
         self.unique_visitors = set() # set of unique visitor_uuids seen in this session
 
     def run(self):
+        # Start MJPEG HTTP server thread
+        try:
+            server = HTTPServer(('0.0.0.0', self.stream_port), StreamingHandler)
+            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            server_thread.start()
+            logger.info(f"MJPEG Stream server running at http://localhost:{self.stream_port}/stream")
+        except Exception as e:
+            logger.error(f"Failed to start MJPEG Stream server: {e}")
+
         self.camera.start()
         logger.info("Pipeline started.")
         
@@ -127,7 +181,7 @@ class UniquePersonCounter:
                     visitor_uuid = self.active_tracks.get(track_id, "Unknown")
                     
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    label = f"ID: {track_id} | UUID: {str(visitor_uuid)[:8]}"
+                    label = f"ID: {track_id} | UUID: {str(visitor_uuid)[:8]} | Conf: {track.score:.2f}"
                     cv2.putText(frame, label, (x1, max(0, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
                 # Premium semi-transparent overlay dashboard at the top-left of the stream
@@ -140,13 +194,23 @@ class UniquePersonCounter:
                 cv2.putText(frame, f"Unique (Session): {len(self.unique_visitors)}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 cv2.putText(frame, f"Total Registered: {len(self.faiss.uuid_mapping)}", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-                # Show the video stream window
-                cv2.imshow("Unique Person Counting", frame)
-                
-                # Exit loop if 'q' is pressed
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    logger.info("Quit signal received from video window.")
-                    break
+                # Encode the frame to JPEG for the HTTP MJPEG stream
+                ret_enc, jpeg_buffer = cv2.imencode('.jpg', frame)
+                if ret_enc:
+                    global latest_frame
+                    with frame_lock:
+                        latest_frame = jpeg_buffer.tobytes()
+
+                # Show the video stream window (safely catch errors if running headlessly)
+                try:
+                    cv2.imshow("Unique Person Counting", frame)
+                    # Exit loop if 'q' is pressed
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        logger.info("Quit signal received from video window.")
+                        break
+                except Exception:
+                    # Sleep slightly if running headlessly to prevent high CPU utilization
+                    time.sleep(0.01)
 
                 # Cleanup stale DB tracks periodically
                 if self.use_db:
@@ -160,7 +224,8 @@ class UniquePersonCounter:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Unique Person Counting System")
     parser.add_argument("--no-db", action="store_true", help="Disable PostgreSQL database logging")
+    parser.add_argument("--port", type=int, default=5000, help="Port to run the HTTP MJPEG stream server on")
     args = parser.parse_args()
     
-    app = UniquePersonCounter(use_db=not args.no_db)
+    app = UniquePersonCounter(use_db=not args.no_db, port=args.port)
     app.run()

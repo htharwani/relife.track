@@ -6,9 +6,10 @@ from utils.logger import logger
 # In production, use the actual yolox/tracker/byte_tracker.py or a pip package like `bytetrack`.
 
 class TrackedObject:
-    def __init__(self, track_id, tlbr):
+    def __init__(self, track_id, tlbr, score=0.0):
         self.track_id = track_id
         self.tlbr = tlbr # top-left-bottom-right [x1, y1, x2, y2]
+        self.score = score
         self.is_activated = True
 
 class ByteTrackerWrapper:
@@ -29,10 +30,12 @@ class ByteTrackerWrapper:
         # 1. Gather current detections passing the confidence threshold
         current_centroids = []
         current_boxes = []
+        current_scores = []
         for box in output_results:
             if box[4] > self.track_thresh:
                 current_centroids.append(self._get_centroid(box))
                 current_boxes.append(box[:4])
+                current_scores.append(box[4])
                 
         # 2. If no current detections, increment lost frames for all tracks and clean up expired ones
         if not current_centroids:
@@ -68,11 +71,11 @@ class ByteTrackerWrapper:
                 # Update matched track: reset lost_frames to 0 and update centroid
                 self.tracks[best_id] = {"centroid": centroid, "lost_frames": 0}
                 matched_track_ids.add(best_id)
-                online_targets.append(TrackedObject(best_id, current_boxes[i]))
+                online_targets.append(TrackedObject(best_id, current_boxes[i], score=current_scores[i]))
             else:
                 # Create a new track
                 self.tracks[self.next_id] = {"centroid": centroid, "lost_frames": 0}
-                online_targets.append(TrackedObject(self.next_id, current_boxes[i]))
+                online_targets.append(TrackedObject(self.next_id, current_boxes[i], score=current_scores[i]))
                 self.next_id += 1
 
         # 4. For all tracks NOT matched in the current frame, increment lost_frames and remove stale ones
