@@ -22,6 +22,21 @@ import time
 latest_frame = None
 frame_lock = threading.Lock()
 
+def get_iou(box1, box2):
+    """Calculates Intersection over Union (IoU) of two bounding boxes [x1, y1, x2, y2]."""
+    xi1 = max(box1[0], box2[0])
+    yi1 = max(box1[1], box2[1])
+    xi2 = min(box1[2], box2[2])
+    yi2 = min(box1[3], box2[3])
+    inter_area = max(0, xi2 - xi1) * max(0, yi2 - yi1)
+    
+    box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    union_area = box1_area + box2_area - inter_area
+    if union_area == 0:
+        return 0.0
+    return float(inter_area) / union_area
+
 class StreamingHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         # Suppress request logging to avoid terminal clutter
@@ -146,6 +161,32 @@ class UniquePersonCounter:
                 # Simulated ByteTrack logic mapping
                 tracked_objects = self.tracker.update(boxes, frame.shape, frame.shape)
                 
+                # Sort tracked objects: prioritize those that already have a face registered, then by score
+                tracked_objects = sorted(
+                    tracked_objects,
+                    key=lambda t: (1 if t.track_id in self.tracks_with_face else 0, t.score),
+                    reverse=True
+                )
+                
+                # Suppress highly overlapping duplicate tracks (IoU > 0.45)
+                suppressed_objects = []
+                for track in tracked_objects:
+                    x1, y1, x2, y2 = map(int, track.tlbr)
+                    box = [x1, y1, x2, y2]
+                    
+                    is_duplicate = False
+                    for kept_track in suppressed_objects:
+                        kx1, ky1, kx2, ky2 = map(int, kept_track.tlbr)
+                        kbox = [kx1, ky1, kx2, ky2]
+                        if get_iou(box, kbox) > 0.45:
+                            is_duplicate = True
+                            break
+                            
+                    if not is_duplicate:
+                        suppressed_objects.append(track)
+                        
+                tracked_objects = suppressed_objects
+                
                 # Tracks active in the current frame
                 active_ids = set()
                 
@@ -239,7 +280,8 @@ class UniquePersonCounter:
                                 visitor_uuid = new_uuid
                             else:
                                 logger.info(f"Upgraded track {track_id} to existing face: {matched_uuid}")
-                                self.uuid_to_stable_id[matched_uuid] = old_display_id
+                                if matched_uuid not in self.uuid_to_stable_id:
+                                    self.uuid_to_stable_id[matched_uuid] = old_display_id
                                 visitor_uuid = matched_uuid
                                 
                             self.active_tracks[track_id] = visitor_uuid
