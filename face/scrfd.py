@@ -16,7 +16,8 @@ class SCRFDDetector:
     def detect(self, img_crop):
         """
         Runs face detection on a cropped image of a person.
-        Returns: list of face bounding boxes [x1, y1, x2, y2, score] and landmarks.
+        Returns: list of face bounding boxes [x1, y1, x2, y2, score, landmarks] where
+        landmarks is a list of 5 keypoints [[x, y, confidence], ...].
         """
         # Simulated face detection output
         # If face found, return its local bounding box relative to img_crop
@@ -28,5 +29,15 @@ class SCRFDDetector:
             fy1 = int(h * 0.10)
             fx2 = int(w * 0.75)
             fy2 = int(h * 0.45)
-            faces.append([fx1, fy1, fx2, fy2, 0.95])
+            
+            # Simulate 5 standard landmarks: [x, y, confidence]
+            # 1. Left Eye, 2. Right Eye, 3. Nose Tip, 4. Left Mouth Corner, 5. Right Mouth Corner
+            landmarks = [
+                [int(w * 0.40), int(h * 0.20), 0.98], # Left Eye
+                [int(w * 0.60), int(h * 0.20), 0.99], # Right Eye
+                [int(w * 0.50), int(h * 0.28), 0.97], # Nose Tip
+                [int(w * 0.42), int(h * 0.38), 0.95], # Left Mouth Corner
+                [int(w * 0.58), int(h * 0.38), 0.96]  # Right Mouth Corner
+            ]
+            faces.append([fx1, fy1, fx2, fy2, 0.95, landmarks])
         return faces

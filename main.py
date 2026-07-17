@@ -135,8 +135,20 @@ class UniquePersonCounter:
                     # 3. Face Detection (always checked for visualization & late registration)
                     faces = self.scrfd.detect(person_crop)
                     
-                    # Store global face box coordinates if face is found
+                    # Validate face based on landmark visibility (require at least 4 visible landmarks)
+                    is_valid_face = False
                     if faces:
+                        face_info = faces[0]
+                        if len(face_info) >= 6:
+                            landmarks = face_info[5]
+                            visible_count = sum(1 for kp in landmarks if len(kp) >= 3 and kp[2] > 0.5)
+                            if visible_count >= 4:
+                                is_valid_face = True
+                        else:
+                            is_valid_face = True # Fallback for backward compatibility
+                    
+                    # Store global face box coordinates if face is valid
+                    if is_valid_face:
                         face_bbox = faces[0][:4]
                         fx1, fy1, fx2, fy2 = map(int, face_bbox)
                         gx1 = max(0, x1 + fx1)
@@ -151,8 +163,8 @@ class UniquePersonCounter:
                         # Existing track, retrieve mapped UUID
                         visitor_uuid = self.active_tracks[track_id]
                         
-                        # Upgrade track to a permanent face ID if a face was just detected for the first time
-                        if faces and track_id not in self.tracks_with_face:
+                        # Upgrade track to a permanent face ID if a valid face was just detected for the first time
+                        if is_valid_face and track_id not in self.tracks_with_face:
                             face_bbox = faces[0][:4]
                             fx1, fy1, fx2, fy2 = map(int, face_bbox)
                             face_crop = person_crop[fy1:fy2, fx1:fx2]
@@ -179,14 +191,15 @@ class UniquePersonCounter:
                         if self.use_db:
                             self.db.update_live_track(track_id, visitor_uuid)
                             self.db.update_visitor_last_seen(visitor_uuid)
-                        self.unique_visitors.add(visitor_uuid)
+                        if track_id in self.tracks_with_face:
+                            self.unique_visitors.add(visitor_uuid)
                         continue
                         
                     # NEW Track detected
                     embedding = None
                     embedding_type = "body"
                     
-                    if faces:
+                    if is_valid_face:
                         # Extract Face Embedding
                         face_bbox = faces[0][:4]
                         fx1, fy1, fx2, fy2 = map(int, face_bbox)
@@ -229,7 +242,9 @@ class UniquePersonCounter:
                         self.db.update_live_track(track_id, visitor_uuid)
                         
                     self.active_tracks[track_id] = visitor_uuid
-                    self.unique_visitors.add(visitor_uuid)
+                    # Only register as a unique visitor in the session if it's a face or recognized permanent visitor
+                    if embedding_type == "face" or (visitor_uuid in self.faiss.uuid_mapping):
+                        self.unique_visitors.add(visitor_uuid)
  
                 # Visualization: Draw bounding boxes and IDs
                 for track in tracked_objects:
