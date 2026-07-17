@@ -1,5 +1,6 @@
 import cv2
 import uuid
+from datetime import datetime
 from config.config_manager import ConfigManager
 from database.postgres_client import PostgresClient
 from vector_db.vector_store import VectorStore
