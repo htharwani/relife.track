@@ -331,8 +331,6 @@ class UniquePersonCounter:
                             visitor_uuid = best_reid_uuid
                             logger.info(f"ReID Track Recovery for track {track_id}: matched with UUID {str(visitor_uuid)[:8]} (Score: {best_reid_score:.4f})")
                             self.reid_history[visitor_uuid] = reid_emb  # update cache
-                            if visitor_uuid in self.unique_visitors:
-                                self.tracks_with_face.add(track_id)
                     except Exception as e:
                         logger.warning(f"ReID recovery check failed for track {track_id}: {e}")
 
@@ -403,7 +401,7 @@ class UniquePersonCounter:
                     display_id = self.uuid_to_stable_id.get(visitor_uuid, track_id)
                     
                     # State Machine: Green (Verified Face) vs Red (Tracking Only)
-                    if track_id in self.tracks_with_face or visitor_uuid in self.unique_visitors:
+                    if track_id in self.tracks_with_face:
                         color = (0, 255, 0) # Green (BGR)
                         label = f"ID: {display_id} | UUID: {str(visitor_uuid)[:8]} | Conf: {track.score:.2f}"
                     else:
