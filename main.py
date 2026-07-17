@@ -134,7 +134,10 @@ class UniquePersonCounter:
                         continue
                         
                     # 3. Face Detection (always checked for visualization & late registration)
-                    faces = self.scrfd.detect(person_crop, simulate=self.simulate_face)
+                    # Only simulate face if the person is sitting up (top of box y1 is in the upper 55% of the frame)
+                    y_threshold = int(frame.shape[0] * 0.55)
+                    can_have_face = (y1 < y_threshold)
+                    faces = self.scrfd.detect(person_crop, simulate=(self.simulate_face and can_have_face))
                     
                     # Validate face based on landmark visibility (require at least 4 visible landmarks)
                     is_valid_face = False
@@ -143,9 +146,11 @@ class UniquePersonCounter:
                         if len(face_info) >= 6:
                             landmarks = face_info[5]
                             visible_count = sum(1 for kp in landmarks if len(kp) >= 3 and kp[2] > 0.5)
+                            logger.info(f"Face detected for Track {track_id}: {visible_count}/5 landmarks visible.")
                             if visible_count >= 4:
                                 is_valid_face = True
                         else:
+                            logger.info(f"Face detected for Track {track_id} (no landmark confidence info).")
                             is_valid_face = True # Fallback for backward compatibility
                     
                     # Store global face box coordinates if face is valid
