@@ -51,3 +51,31 @@ class VectorStore:
         if best_score > threshold and best_idx != -1:
             return self.uuid_mapping[best_idx], best_score
         return None, best_score
+
+    def update_embedding(self, visitor_uuid, new_embedding):
+        """Replaces the existing embedding for visitor_uuid with a higher-quality one."""
+        indices_to_update = [i for i, u in enumerate(self.uuid_mapping) if u == visitor_uuid]
+        if not indices_to_update:
+            return False
+            
+        ntotal = self.index.ntotal
+        if ntotal == 0:
+            return False
+            
+        try:
+            reconstructed_vectors = []
+            for i in range(ntotal):
+                vec = self.index.reconstruct(i)
+                if i in indices_to_update:
+                    vec = new_embedding
+                reconstructed_vectors.append(vec)
+                
+            self.index = faiss.IndexFlatIP(self.dim)
+            if reconstructed_vectors:
+                self.index.add(np.array(reconstructed_vectors, dtype=np.float32))
+            self.save()
+            logger.info(f"FAISS index rebuilt. Successfully updated embedding for UUID: {str(visitor_uuid)[:8]}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to update FAISS embedding: {e}")
+            return False

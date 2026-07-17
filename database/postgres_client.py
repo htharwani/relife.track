@@ -49,11 +49,29 @@ class PostgresClient:
             self.conn.autocommit = True
             logger.info(f"Successfully connected to PostgreSQL at {host}:{port}/{dbname} (sslmode={sslmode})")
         except Exception as e:
-            logger.error(f"Database connection failed: {e}")
-            raise
+            logger.error(f"Database connection failed: {e}. Running in degraded offline mode.")
+            self.conn = None
+
+    def reconnect(self):
+        logger.info("Attempting to reconnect to PostgreSQL database...")
+        try:
+            if self.conn:
+                try:
+                    self.conn.close()
+                except:
+                    pass
+            self.connect()
+            return self.conn is not None
+        except Exception as e:
+            logger.error(f"Failed to reconnect to database: {e}")
+            return False
 
     def _initialize_schema(self):
         """Creates the necessary tables if they don't exist."""
+        if not self.conn:
+            logger.warning("Database connection unavailable. Skipping schema initialization.")
+            return
+            
         queries = [
             """
             CREATE TABLE IF NOT EXISTS visitors (
@@ -92,6 +110,8 @@ class PostgresClient:
             logger.warning(f"Failed to check/initialize database schema: {e}")
 
     def get_all_visitors(self):
+        if not self.conn:
+            return []
         query = "SELECT uuid, embedding_type FROM visitors ORDER BY first_seen ASC;"
         try:
             with self.conn.cursor() as cur:
@@ -99,9 +119,12 @@ class PostgresClient:
                 return cur.fetchall()
         except Exception as e:
             logger.error(f"Failed to fetch all visitors: {e}")
+            self.reconnect()
             return []
 
     def insert_visitor(self, visitor_uuid, embedding_type):
+        if not self.conn:
+            return
         now = datetime.now()
         query = """
         INSERT INTO visitors (uuid, first_seen, last_seen, embedding_type)
@@ -109,25 +132,43 @@ class PostgresClient:
         ON CONFLICT (uuid) DO UPDATE 
         SET last_seen = EXCLUDED.last_seen;
         """
-        with self.conn.cursor() as cur:
-            cur.execute(query, (str(visitor_uuid), now, now, embedding_type))
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(query, (str(visitor_uuid), now, now, embedding_type))
+        except Exception as e:
+            logger.error(f"Failed to insert visitor: {e}")
+            self.reconnect()
 
     def update_visitor_last_seen(self, visitor_uuid):
+        if not self.conn:
+            return
         now = datetime.now()
         query = "UPDATE visitors SET last_seen = %s WHERE uuid = %s;"
-        with self.conn.cursor() as cur:
-            cur.execute(query, (now, str(visitor_uuid)))
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(query, (now, str(visitor_uuid)))
+        except Exception as e:
+            logger.error(f"Failed to update visitor last seen: {e}")
+            self.reconnect()
 
     def log_event(self, visitor_uuid, camera_id="camera_1"):
+        if not self.conn:
+            return
         now = datetime.now()
         query = """
         INSERT INTO visitor_events (visitor_uuid, timestamp, camera_id)
         VALUES (%s, %s, %s);
         """
-        with self.conn.cursor() as cur:
-            cur.execute(query, (str(visitor_uuid), now, camera_id))
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(query, (str(visitor_uuid), now, camera_id))
+        except Exception as e:
+            logger.error(f"Failed to log event: {e}")
+            self.reconnect()
 
     def update_live_track(self, track_id, visitor_uuid):
+        if not self.conn:
+            return
         now = datetime.now()
         query = """
         INSERT INTO live_tracks (track_id, visitor_uuid, last_updated)
@@ -136,18 +177,30 @@ class PostgresClient:
         SET visitor_uuid = EXCLUDED.visitor_uuid,
             last_updated = EXCLUDED.last_updated;
         """
-        with self.conn.cursor() as cur:
-            cur.execute(query, (track_id, str(visitor_uuid), now))
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(query, (track_id, str(visitor_uuid), now))
+        except Exception as e:
+            logger.error(f"Failed to update live track: {e}")
+            self.reconnect()
             
     def delete_stale_tracks(self, timeout_seconds=60):
+        if not self.conn:
+            return
         query = """
         DELETE FROM live_tracks 
         WHERE last_updated < NOW() - INTERVAL '%s seconds';
         """
-        with self.conn.cursor() as cur:
-            cur.execute(query, (timeout_seconds,))
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(query, (timeout_seconds,))
+        except Exception as e:
+            logger.error(f"Failed to delete stale tracks: {e}")
+            self.reconnect()
 
     def upsert_people_count_hourly(self, camera_id, total_in, total_out, peak_occupancy, avg_occupancy):
+        if not self.conn:
+            return
         now = datetime.now()
         report_date = now.date()
         report_hour = now.hour
@@ -185,3 +238,4 @@ class PostgresClient:
                     cur.execute(insert_query, (camera_id, report_date, report_hour, total_in, total_out, peak_occupancy, float(avg_occupancy), now))
         except Exception as e:
             logger.error(f"Failed to upsert hourly metrics: {e}")
+            self.reconnect()

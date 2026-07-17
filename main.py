@@ -157,6 +157,9 @@ class UniquePersonCounter:
         
         # Tracks timestamps of when each visitor UUID was last active
         self.reid_last_seen = {}
+        
+        # Stores the best face detection score obtained for each track_id in the current session
+        self.track_best_face_score = {}
 
     def run(self):
         # Start MJPEG HTTP server thread
@@ -272,15 +275,17 @@ class UniquePersonCounter:
                     is_valid_face = False
                     if faces:
                         face_info = faces[0]
-                        if len(face_info) >= 6:
-                            landmarks = face_info[5]
-                            visible_count = sum(1 for kp in landmarks if len(kp) >= 3 and kp[2] > 0.5)
-                            logger.info(f"Face detected for Track {track_id}: {visible_count}/5 landmarks visible.")
-                            if visible_count >= 4:
-                                is_valid_face = True
-                        else:
-                            logger.info(f"Face detected for Track {track_id} (no confidence info).")
+                        face_score = face_info[4]
+                        fx1, fy1, fx2, fy2 = face_info[:4]
+                        fw = fx2 - fx1
+                        fh = fy2 - fy1
+                        
+                        # Only accept high-confidence, clear face detections (conf >= 0.72, size >= 24px)
+                        if face_score >= 0.72 and fw >= 24 and fh >= 24:
                             is_valid_face = True
+                            logger.info(f"Valid face detected for Track {track_id}: score = {face_score:.2f}, size = {fw}x{fh}")
+                        else:
+                            logger.info(f"Face ignored for Track {track_id}: score = {face_score:.2f}, size = {fw}x{fh} (does not meet criteria)")
                             
                     if is_valid_face:
                         face_bbox = faces[0][:4]
@@ -295,36 +300,50 @@ class UniquePersonCounter:
                         
                     visitor_uuid = self.active_tracks[track_id]
                     
-                    # Upgrade track to face if face detected for the first time
-                    if is_valid_face and track_id not in self.tracks_with_face:
+                    # Upgrade track to face if face detected for the first time or if a significantly better face is seen
+                    if is_valid_face:
                         face_bbox = faces[0][:4]
                         fx1, fy1, fx2, fy2 = map(int, face_bbox)
                         face_crop = person_crop[fy1:fy2, fx1:fx2]
-                        raw_embedding = self.arcface.extract(face_crop)
-                        embedding = normalize_embedding(raw_embedding)
+                        face_score = faces[0][4]
                         
-                        thresh = self.config['pipeline']['faiss_similarity_threshold']
-                        matched_uuid, score = self.faiss.search(embedding, threshold=thresh)
-                        logger.info(f"Upgrade FAISS search for track {track_id}: score = {score:.4f} (Threshold: {thresh})")
+                        best_prev_score = self.track_best_face_score.get(track_id, 0.0)
                         
-                        old_display_id = self.uuid_to_stable_id.get(visitor_uuid, track_id)
-                        if not matched_uuid:
-                            new_uuid = uuid.uuid4()
-                            self.faiss.add_embedding(embedding, new_uuid)
-                            if self.use_db:
-                                self.db.insert_visitor(new_uuid, "face")
-                            logger.info(f"Upgraded track {track_id} to new face: {new_uuid}")
-                            self.uuid_to_stable_id[new_uuid] = old_display_id
-                            visitor_uuid = new_uuid
-                        else:
-                            logger.info(f"Upgraded track {track_id} to existing face: {matched_uuid}")
-                            if matched_uuid not in self.uuid_to_stable_id:
-                                self.uuid_to_stable_id[matched_uuid] = old_display_id
-                            visitor_uuid = matched_uuid
+                        # Only extract and register/update embedding if we haven't verified a face yet,
+                        # OR if the new face crop is significantly cleaner/closer (score > previous best + 0.05)
+                        if track_id not in self.tracks_with_face or face_score > best_prev_score + 0.05:
+                            raw_embedding = self.arcface.extract(face_crop)
+                            embedding = normalize_embedding(raw_embedding)
                             
-                        self.active_tracks[track_id] = visitor_uuid
-                        self.tracks_with_face.add(track_id)
-                        self.unique_visitors.add(visitor_uuid)
+                            if track_id not in self.tracks_with_face:
+                                thresh = self.config['pipeline']['faiss_similarity_threshold']
+                                matched_uuid, score = self.faiss.search(embedding, threshold=thresh)
+                                logger.info(f"Upgrade FAISS search for track {track_id}: score = {score:.4f} (Threshold: {thresh})")
+                                
+                                old_display_id = self.uuid_to_stable_id.get(visitor_uuid, track_id)
+                                if not matched_uuid:
+                                    new_uuid = uuid.uuid4()
+                                    self.faiss.add_embedding(embedding, new_uuid)
+                                    if self.use_db:
+                                        self.db.insert_visitor(new_uuid, "face")
+                                    logger.info(f"Upgraded track {track_id} to new face: {new_uuid}")
+                                    self.uuid_to_stable_id[new_uuid] = old_display_id
+                                    visitor_uuid = new_uuid
+                                else:
+                                    logger.info(f"Upgraded track {track_id} to existing face: {matched_uuid}")
+                                    if matched_uuid not in self.uuid_to_stable_id:
+                                        self.uuid_to_stable_id[matched_uuid] = old_display_id
+                                    visitor_uuid = matched_uuid
+                                    
+                                self.active_tracks[track_id] = visitor_uuid
+                                self.tracks_with_face.add(track_id)
+                                self.unique_visitors.add(visitor_uuid)
+                            else:
+                                # Track already verified, but this is a much cleaner face image! Update the embedding template.
+                                self.faiss.update_embedding(visitor_uuid, embedding)
+                                logger.info(f"Updated stored face template for visitor {visitor_uuid} with higher score: {face_score:.2f} (was {best_prev_score:.2f})")
+                                
+                            self.track_best_face_score[track_id] = face_score
                         
                     if visitor_uuid not in self.uuid_to_stable_id:
                         self.uuid_to_stable_id[visitor_uuid] = self.next_display_id
@@ -380,15 +399,17 @@ class UniquePersonCounter:
                     is_valid_face = False
                     if faces:
                         face_info = faces[0]
-                        if len(face_info) >= 6:
-                            landmarks = face_info[5]
-                            visible_count = sum(1 for kp in landmarks if len(kp) >= 3 and kp[2] > 0.5)
-                            logger.info(f"Face detected for Track {track_id}: {visible_count}/5 landmarks visible.")
-                            if visible_count >= 4:
-                                is_valid_face = True
-                        else:
-                            logger.info(f"Face detected for Track {track_id} (no confidence info).")
+                        face_score = face_info[4]
+                        fx1, fy1, fx2, fy2 = face_info[:4]
+                        fw = fx2 - fx1
+                        fh = fy2 - fy1
+                        
+                        # Only accept high-confidence, clear face detections (conf >= 0.72, size >= 24px)
+                        if face_score >= 0.72 and fw >= 24 and fh >= 24:
                             is_valid_face = True
+                            logger.info(f"Valid face detected for Track {track_id}: score = {face_score:.2f}, size = {fw}x{fh}")
+                        else:
+                            logger.info(f"Face ignored for Track {track_id}: score = {face_score:.2f}, size = {fw}x{fh} (does not meet criteria)")
                             
                     if is_valid_face:
                         face_bbox = faces[0][:4]
@@ -440,9 +461,12 @@ class UniquePersonCounter:
                             face_bbox = faces[0][:4]
                             fx1, fy1, fx2, fy2 = map(int, face_bbox)
                             face_crop = person_crop[fy1:fy2, fx1:fx2]
+                            face_score = faces[0][4]
+                            
                             raw_embedding = self.arcface.extract(face_crop)
                             embedding = normalize_embedding(raw_embedding)
                             self.tracks_with_face.add(track_id)
+                            self.track_best_face_score[track_id] = face_score
                             
                             # Search face in FAISS
                             threshold = self.config['pipeline']['faiss_similarity_threshold']
@@ -561,6 +585,7 @@ class UniquePersonCounter:
                 self.tracks_with_face = {tid for tid in self.tracks_with_face if tid in active_ids}
                 self.track_face_bbox = {tid: bbox for tid, bbox in self.track_face_bbox.items() if tid in active_ids}
                 self.smoothed_bboxes = {tid: box for tid, box in self.smoothed_bboxes.items() if tid in active_ids}
+                self.track_best_face_score = {tid: score for tid, score in self.track_best_face_score.items() if tid in active_ids}
                 
                 if self.use_db:
                     self.db.delete_stale_tracks()
