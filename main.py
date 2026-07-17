@@ -91,7 +91,7 @@ class UniquePersonCounter:
         self.unique_visitors = set() # set of unique visitor_uuids seen in this session
         self.tracks_with_face = set() # track_ids that have had a face registered
         self.track_face_bbox = {} # track_id: (x1, y1, x2, y2) global coordinates of face
-        self.simulate_face = True # Toggle to simulate face visibility
+        self.simulate_face = False # Toggle to simulate face visibility
 
     def run(self):
         # Start MJPEG HTTP server thread
