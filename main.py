@@ -9,6 +9,7 @@ from tracker.byte_tracker import ByteTrackerWrapper
 from face.scrfd import SCRFDDetector
 from face.arcface import ArcFaceExtractor
 from reid.repvgg import RepVGGReID
+from detector.hailo_device import HailoDeviceManager
 from utils.logger import logger
 from utils.normalization import normalize_embedding
 import argparse
@@ -67,17 +68,20 @@ class UniquePersonCounter:
             self.db = None
         self.faiss = VectorStore(dim=512)
         
+        # Initialize Shared Hailo Device Manager
+        self.device_manager = HailoDeviceManager()
+        
         # Init Models
         models_cfg = self.config['models']
         pipeline_cfg = self.config.get('pipeline', {})
         yolo_thresh = pipeline_cfg.get('yolo_threshold', 0.4)
         face_thresh = pipeline_cfg.get('face_threshold', 0.5)
         
-        self.detector = HailoYOLODetector(models_cfg['yolo'], conf_threshold=yolo_thresh)
+        self.detector = HailoYOLODetector(models_cfg['yolo'], device_manager=self.device_manager, conf_threshold=yolo_thresh)
         self.tracker = ByteTrackerWrapper(track_thresh=yolo_thresh)
-        self.scrfd = SCRFDDetector(models_cfg['scrfd'], conf_threshold=face_thresh)
-        self.arcface = ArcFaceExtractor(models_cfg['arcface'])
-        self.reid = RepVGGReID(models_cfg['reid'])
+        self.scrfd = SCRFDDetector(models_cfg['scrfd'], device_manager=self.device_manager, conf_threshold=face_thresh)
+        self.arcface = ArcFaceExtractor(models_cfg['arcface'], device_manager=self.device_manager)
+        self.reid = RepVGGReID(models_cfg['reid'], device_manager=self.device_manager)
         
         # Init Camera
         self.camera = CameraStream(self.config['camera'])
@@ -178,7 +182,9 @@ class UniquePersonCounter:
                             embedding = normalize_embedding(raw_embedding)
                             
                             # Search face in FAISS
-                            matched_uuid, score = self.faiss.search(embedding, threshold=self.config['pipeline']['faiss_similarity_threshold'])
+                            thresh = self.config['pipeline']['faiss_similarity_threshold']
+                            matched_uuid, score = self.faiss.search(embedding, threshold=thresh)
+                            logger.info(f"Upgrade FAISS search for track {track_id}: score = {score:.4f} (Threshold: {thresh})")
                             if not matched_uuid:
                                 # New face visitor: register permanently (FAISS + DB)
                                 visitor_uuid = uuid.uuid4()
@@ -214,6 +220,7 @@ class UniquePersonCounter:
                         # Search face in FAISS
                         threshold = self.config['pipeline']['faiss_similarity_threshold']
                         visitor_uuid, score = self.faiss.search(embedding, threshold=threshold)
+                        logger.info(f"New track FAISS search for track {track_id}: score = {score:.4f} (Threshold: {threshold})")
                         
                         if not visitor_uuid:
                             # Register new face permanently

@@ -4,8 +4,9 @@ from utils.logger import logger
 from contextlib import ExitStack
 
 class HailoYOLODetector:
-    def __init__(self, hef_path, conf_threshold=0.4):
+    def __init__(self, hef_path, device_manager=None, conf_threshold=0.4):
         self.hef_path = hef_path
+        self.device_manager = device_manager
         self.conf_threshold = conf_threshold
         logger.info(f"Initializing Hailo YOLO detector with {self.hef_path}")
         self._load_model()
@@ -17,13 +18,20 @@ class HailoYOLODetector:
             
         try:
             from hailo_platform import (HEF, VDevice, HailoStreamInterface, ConfigureParams, 
-                                      InputVStreamParams, OutputVStreamParams, InferVStreams, FormatType)
+                                       InputVStreamParams, OutputVStreamParams, InferVStreams, FormatType)
         except ImportError:
             logger.error("hailo_platform is not installed. Please install HailoRT Python API.")
             return
 
         self.hef = HEF(self.hef_path)
-        self.target = VDevice()
+        
+        # Use shared VDevice target if provided
+        if self.device_manager and self.device_manager.device is not None:
+            self.target = self.device_manager.device
+            logger.info("Using shared VDevice context in YOLO detector.")
+        else:
+            self.target = VDevice()
+            logger.warning("No shared VDevice context provided. Initializing standalone VDevice.")
         
         configure_params = ConfigureParams.create_from_hef(self.hef, interface=HailoStreamInterface.PCIe)
         self.network_groups = self.target.configure(self.hef, configure_params)
@@ -119,5 +127,8 @@ class HailoYOLODetector:
     def __del__(self):
         if hasattr(self, 'exit_stack'):
             self.exit_stack.close()
-        if hasattr(self, 'target'):
-            self.target.release()
+        if hasattr(self, 'target') and (not self.device_manager or self.device_manager.device is None):
+            try:
+                self.target.release()
+            except Exception as e:
+                logger.error(f"Error releasing standalone YOLO VDevice: {e}")
