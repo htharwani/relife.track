@@ -87,6 +87,7 @@ class UniquePersonCounter:
         self.unique_visitors = set() # set of unique visitor_uuids seen in this session
         self.tracks_with_face = set() # track_ids that have had a face registered
         self.track_face_bbox = {} # track_id: (x1, y1, x2, y2) global coordinates of face
+        self.simulate_face = True # Toggle to simulate face visibility
 
     def run(self):
         # Start MJPEG HTTP server thread
@@ -133,7 +134,7 @@ class UniquePersonCounter:
                         continue
                         
                     # 3. Face Detection (always checked for visualization & late registration)
-                    faces = self.scrfd.detect(person_crop)
+                    faces = self.scrfd.detect(person_crop, simulate=self.simulate_face)
                     
                     # Validate face based on landmark visibility (require at least 4 visible landmarks)
                     is_valid_face = False
@@ -196,9 +197,6 @@ class UniquePersonCounter:
                         continue
                         
                     # NEW Track detected
-                    embedding = None
-                    embedding_type = "body"
-                    
                     if is_valid_face:
                         # Extract Face Embedding
                         face_bbox = faces[0][:4]
@@ -206,45 +204,35 @@ class UniquePersonCounter:
                         face_crop = person_crop[fy1:fy2, fx1:fx2]
                         raw_embedding = self.arcface.extract(face_crop)
                         embedding = normalize_embedding(raw_embedding)
-                        embedding_type = "face"
                         self.tracks_with_face.add(track_id)
-                    else:
-                        # Extract Body Embedding (ReID)
-                        raw_embedding = self.reid.extract(person_crop)
-                        embedding = normalize_embedding(raw_embedding)
-                        embedding_type = "body"
                         
-                    # Vector Search in FAISS
-                    threshold = self.config['pipeline']['faiss_similarity_threshold']
-                    if embedding_type == "body":
-                        threshold = max(threshold, 0.90)
+                        # Search face in FAISS
+                        threshold = self.config['pipeline']['faiss_similarity_threshold']
+                        visitor_uuid, score = self.faiss.search(embedding, threshold=threshold)
                         
-                    visitor_uuid, score = self.faiss.search(embedding, threshold=threshold)
-                    
-                    if not visitor_uuid:
-                        visitor_uuid = uuid.uuid4()
-                        if embedding_type == "face":
-                            # Permanent face registration (FAISS + DB)
+                        if not visitor_uuid:
+                            # Register new face permanently
+                            visitor_uuid = uuid.uuid4()
                             self.faiss.add_embedding(embedding, visitor_uuid)
                             if self.use_db:
                                 self.db.insert_visitor(visitor_uuid, "face")
                             logger.info(f"New face visitor registered permanently: {visitor_uuid}")
                         else:
-                            # Temporary body visitor tracked (added to DB for constraint stability, but NOT to FAISS)
-                            if self.use_db:
-                                self.db.insert_visitor(visitor_uuid, "body")
-                            logger.info(f"Temporary body visitor tracked: {visitor_uuid}")
+                            logger.info(f"Existing face visitor recognized: {visitor_uuid} (Score: {score:.2f})")
+                            
+                        self.unique_visitors.add(visitor_uuid)
                     else:
-                        logger.info(f"Existing visitor recognized: {visitor_uuid} (Score: {score:.2f}, Type: {embedding_type})")
+                        # Temporary tracking only (no valid face detected)
+                        visitor_uuid = uuid.uuid4()
+                        if self.use_db:
+                            self.db.insert_visitor(visitor_uuid, "body")
+                        logger.info(f"Temporary visitor tracked (No Face): {visitor_uuid}")
                         
                     if self.use_db:
                         self.db.log_event(visitor_uuid, camera_id="imx500")
                         self.db.update_live_track(track_id, visitor_uuid)
                         
                     self.active_tracks[track_id] = visitor_uuid
-                    # Only register as a unique visitor in the session if it's a face or recognized permanent visitor
-                    if embedding_type == "face" or (visitor_uuid in self.faiss.uuid_mapping):
-                        self.unique_visitors.add(visitor_uuid)
  
                 # Visualization: Draw bounding boxes and IDs
                 for track in tracked_objects:
@@ -252,26 +240,35 @@ class UniquePersonCounter:
                     track_id = track.track_id
                     visitor_uuid = self.active_tracks.get(track_id, "Unknown")
                     
-                    # Draw body box
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    label = f"ID: {track_id} | UUID: {str(visitor_uuid)[:8]} | Conf: {track.score:.2f}"
-                    cv2.putText(frame, label, (x1, max(0, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                    # State Machine: Green (Verified Face) vs Red (Tracking Only)
+                    if track_id in self.tracks_with_face:
+                        color = (0, 255, 0) # Green (BGR)
+                        label = f"ID: {track_id} | UUID: {str(visitor_uuid)[:8]} | Conf: {track.score:.2f}"
+                    else:
+                        color = (0, 0, 255) # Red (BGR)
+                        label = f"ID: {track_id} | Tracking | Conf: {track.score:.2f}"
                     
-                    # Draw face bounding box if detected
+                    # Draw body box
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                    cv2.putText(frame, label, (x1, max(0, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                    
+                    # Draw face bounding box if detected in this frame
                     if track_id in self.track_face_bbox:
                         fx1, fy1, fx2, fy2 = self.track_face_bbox[track_id]
-                        cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), (255, 0, 0), 2)  # Draw face box in Blue/Cyan
-                        cv2.putText(frame, "Face", (fx1, max(0, fy1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 0), 1)
+                        cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), (255, 255, 0), 2)  # Draw face box in Cyan/Yellow
+                        cv2.putText(frame, "Face", (fx1, max(0, fy1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 0), 1)
  
                 # Premium semi-transparent overlay dashboard at the top-left of the stream
                 overlay = frame.copy()
-                cv2.rectangle(overlay, (10, 10), (320, 85), (0, 0, 0), -1)
+                cv2.rectangle(overlay, (10, 10), (320, 95), (0, 0, 0), -1)
                 alpha = 0.65  # Transparency factor
                 cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
  
                 # Draw the unique visitor metrics text on top of the overlay
-                cv2.putText(frame, f"Unique (Session): {len(self.unique_visitors)}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                cv2.putText(frame, f"Total Registered: {len(self.faiss.uuid_mapping)}", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                cv2.putText(frame, f"Unique (Session): {len(self.unique_visitors)}", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
+                cv2.putText(frame, f"Total Registered: {len(self.faiss.uuid_mapping)}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+                sim_status = "ON" if self.simulate_face else "OFF (Backside)"
+                cv2.putText(frame, f"Face Sim (Press 'F'): {sim_status}", (20, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
  
                 # Encode the frame to JPEG for the HTTP MJPEG stream
                 ret_enc, jpeg_buffer = cv2.imencode('.jpg', frame)
@@ -283,10 +280,13 @@ class UniquePersonCounter:
                 # Show the video stream window (safely catch errors if running headlessly)
                 try:
                     cv2.imshow("Unique Person Counting", frame)
-                    # Exit loop if 'q' is pressed
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord('q'):
                         logger.info("Quit signal received from video window.")
                         break
+                    elif key == ord('f'):
+                        self.simulate_face = not self.simulate_face
+                        logger.info(f"Toggled face simulation: {self.simulate_face}")
                 except Exception:
                     # Sleep slightly if running headlessly to prevent high CPU utilization
                     time.sleep(0.01)

@@ -7,7 +7,7 @@ pipeline:
   yolo_threshold: 0.6
   face_threshold: 0.5
   reid_threshold: 0.5
-  faiss_similarity_threshold: 0.7
+  faiss_similarity_threshold: 0.85
 
 database:
   host: "localhost"

@@ -13,7 +13,7 @@ class SCRFDDetector:
             raise ValueError("HEF path for SCRFD is empty.")
         logger.info("SCRFD Model loaded successfully on Hailo.")
 
-    def detect(self, img_crop):
+    def detect(self, img_crop, simulate=True):
         """
         Runs face detection on a cropped image of a person.
         Returns: list of face bounding boxes [x1, y1, x2, y2, score, landmarks] where
@@ -22,6 +22,9 @@ class SCRFDDetector:
         # Simulated face detection output
         # If face found, return its local bounding box relative to img_crop
         faces = [] 
+        if not simulate:
+            return faces
+            
         h, w = img_crop.shape[:2]
         if h > 80 and w > 80:
             aspect_ratio = h / w
