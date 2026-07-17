@@ -271,15 +271,21 @@ class UniquePersonCounter:
                         raw_reid = self.reid.extract(person_crop)
                         reid_emb = normalize_embedding(raw_reid)
                         
+                        # Get currently active visitor UUIDs in the frame
+                        active_uuids = set(self.active_tracks.values())
+                        
                         best_reid_uuid = None
                         best_reid_score = -1.0
                         for u, cached_emb in self.reid_history.items():
+                            if u in active_uuids:
+                                continue  # Skip people who are already active in the frame
+                                
                             score = np.dot(reid_emb, cached_emb)
                             if score > best_reid_score:
                                 best_reid_score = score
                                 best_reid_uuid = u
                                 
-                        if best_reid_score > 0.60:
+                        if best_reid_score > 0.70:
                             visitor_uuid = best_reid_uuid
                             logger.info(f"ReID Track Recovery for track {track_id}: matched with UUID {str(visitor_uuid)[:8]} (Score: {best_reid_score:.4f})")
                             self.reid_history[visitor_uuid] = reid_emb  # update cache
