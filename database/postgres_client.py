@@ -2,7 +2,23 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from utils.logger import logger
 import uuid
+import os
 from datetime import datetime
+
+def load_env_file(filepath=".env"):
+    env_vars = {}
+    if os.path.exists(filepath):
+        with open(filepath, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    key, val = line.split("=", 1)
+                    key = key.strip()
+                    val = val.strip().strip('"').strip("'")
+                    env_vars[key] = val
+    return env_vars
 
 class PostgresClient:
     def __init__(self, config):
@@ -12,16 +28,26 @@ class PostgresClient:
         self._initialize_schema()
 
     def connect(self):
+        env_vars = load_env_file()
+        
+        host = env_vars.get('DB_HOST') or self.config.get('host')
+        port = env_vars.get('DB_PORT') or self.config.get('port')
+        user = env_vars.get('DB_USER') or self.config.get('user')
+        password = env_vars.get('DB_PASSWORD') or self.config.get('password')
+        dbname = env_vars.get('DB_NAME') or self.config.get('dbname')
+        sslmode = env_vars.get('DB_SSLMODE') or self.config.get('sslmode', 'disable')
+        
         try:
             self.conn = psycopg2.connect(
-                host=self.config.get('host'),
-                port=self.config.get('port'),
-                user=self.config.get('user'),
-                password=self.config.get('password'),
-                dbname=self.config.get('dbname')
+                host=host,
+                port=port,
+                user=user,
+                password=password,
+                dbname=dbname,
+                sslmode=sslmode
             )
             self.conn.autocommit = True
-            logger.info("Successfully connected to PostgreSQL")
+            logger.info(f"Successfully connected to PostgreSQL at {host}:{port}/{dbname} (sslmode={sslmode})")
         except Exception as e:
             logger.error(f"Database connection failed: {e}")
             raise
@@ -56,10 +82,14 @@ class PostgresClient:
         try:
             with self.conn.cursor() as cur:
                 for q in queries:
-                    cur.execute(q)
-            logger.info("Database schema initialized.")
+                    try:
+                        cur.execute(q)
+                    except Exception as e:
+                        logger.warning(f"Could not execute table initialization query: {e}. Resetting transaction.")
+                        self.conn.rollback()
+            logger.info("Database schema check finished.")
         except Exception as e:
-            logger.error(f"Failed to initialize database schema: {e}")
+            logger.warning(f"Failed to check/initialize database schema: {e}")
 
     def insert_visitor(self, visitor_uuid, embedding_type):
         now = datetime.now()
@@ -106,3 +136,42 @@ class PostgresClient:
         """
         with self.conn.cursor() as cur:
             cur.execute(query, (timeout_seconds,))
+
+    def upsert_people_count_hourly(self, camera_id, total_in, total_out, peak_occupancy, avg_occupancy):
+        now = datetime.now()
+        report_date = now.date()
+        report_hour = now.hour
+        
+        # Check if record exists for this camera, date, and hour
+        check_query = """
+        SELECT id FROM public.people_count_hourly 
+        WHERE camera_id = %s AND report_date = %s AND report_hour = %s;
+        """
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(check_query, (camera_id, report_date, report_hour))
+                row = cur.fetchone()
+                
+                if row:
+                    # Update existing record
+                    update_query = """
+                    UPDATE public.people_count_hourly
+                    SET total_in = %s,
+                        total_out = %s,
+                        peak_occupancy = GREATEST(peak_occupancy, %s),
+                        avg_occupancy = %s,
+                        created_at = %s
+                    WHERE id = %s;
+                    """
+                    cur.execute(update_query, (total_in, total_out, peak_occupancy, float(avg_occupancy), now, row[0]))
+                else:
+                    # Insert new record
+                    insert_query = """
+                    INSERT INTO public.people_count_hourly (
+                        camera_id, report_date, report_hour, total_in, total_out, peak_occupancy, avg_occupancy, created_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
+                    """
+                    cur.execute(insert_query, (camera_id, report_date, report_hour, total_in, total_out, peak_occupancy, float(avg_occupancy), now))
+        except Exception as e:
+            logger.error(f"Failed to upsert hourly metrics: {e}")

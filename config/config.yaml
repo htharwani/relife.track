@@ -1,4 +1,5 @@
 camera:
+  id: 1
   resolution_width: 640
   resolution_height: 640
   framerate: 30

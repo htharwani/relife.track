@@ -92,6 +92,19 @@ class UniquePersonCounter:
         self.tracks_with_face = set() # track_ids that have had a face registered
         self.track_face_bbox = {} # track_id: (x1, y1, x2, y2) global coordinates of face
         self.simulate_face = False # Toggle to simulate face visibility
+        
+        # Hourly statistics
+        self.camera_id = self.config['camera'].get('id', 1)
+        self.hourly_total_in = 0
+        self.hourly_total_out = 0
+        self.hourly_peak_occupancy = 0
+        self.hourly_occupancy_samples = []
+        self.current_hour = datetime.now().hour
+        self.current_date = datetime.now().date()
+        self.last_db_sync_time = 0
+        
+        # ReID body cache (visitor_uuid: last_reid_embedding)
+        self.reid_history = {}
 
     def run(self):
         # Start MJPEG HTTP server thread
@@ -200,46 +213,87 @@ class UniquePersonCounter:
                             self.tracks_with_face.add(track_id)
                             self.unique_visitors.add(visitor_uuid)
                             
+                        # Update ReID history with current crop to adapt to angle/light shifts
+                        try:
+                            raw_reid = self.reid.extract(person_crop)
+                            reid_emb = normalize_embedding(raw_reid)
+                            self.reid_history[visitor_uuid] = reid_emb
+                        except Exception as e:
+                            logger.warning(f"Failed to update ReID history for track {track_id}: {e}")
+                            
                         if self.use_db:
                             self.db.update_live_track(track_id, visitor_uuid)
                             self.db.update_visitor_last_seen(visitor_uuid)
-                        if track_id in self.tracks_with_face:
+                        if track_id in self.tracks_with_face or visitor_uuid in self.unique_visitors:
                             self.unique_visitors.add(visitor_uuid)
                         continue
                         
-                    # NEW Track detected
-                    if is_valid_face:
-                        # Extract Face Embedding
-                        face_bbox = faces[0][:4]
-                        fx1, fy1, fx2, fy2 = map(int, face_bbox)
-                        face_crop = person_crop[fy1:fy2, fx1:fx2]
-                        raw_embedding = self.arcface.extract(face_crop)
-                        embedding = normalize_embedding(raw_embedding)
-                        self.tracks_with_face.add(track_id)
+                    # NEW Track detected: Search ReID history to see if we can recover identity first!
+                    visitor_uuid = None
+                    try:
+                        raw_reid = self.reid.extract(person_crop)
+                        reid_emb = normalize_embedding(raw_reid)
                         
-                        # Search face in FAISS
-                        threshold = self.config['pipeline']['faiss_similarity_threshold']
-                        visitor_uuid, score = self.faiss.search(embedding, threshold=threshold)
-                        logger.info(f"New track FAISS search for track {track_id}: score = {score:.4f} (Threshold: {threshold})")
-                        
-                        if not visitor_uuid:
-                            # Register new face permanently
-                            visitor_uuid = uuid.uuid4()
-                            self.faiss.add_embedding(embedding, visitor_uuid)
-                            if self.use_db:
-                                self.db.insert_visitor(visitor_uuid, "face")
-                            logger.info(f"New face visitor registered permanently: {visitor_uuid}")
-                        else:
-                            logger.info(f"Existing face visitor recognized: {visitor_uuid} (Score: {score:.2f})")
+                        best_reid_uuid = None
+                        best_reid_score = -1.0
+                        for u, cached_emb in self.reid_history.items():
+                            score = np.dot(reid_emb, cached_emb)
+                            if score > best_reid_score:
+                                best_reid_score = score
+                                best_reid_uuid = u
+                                
+                        if best_reid_score > 0.75:
+                            visitor_uuid = best_reid_uuid
+                            logger.info(f"ReID Track Recovery for track {track_id}: matched with UUID {str(visitor_uuid)[:8]} (Score: {best_reid_score:.4f})")
+                            self.reid_history[visitor_uuid] = reid_emb  # update cache
+                            if visitor_uuid in self.unique_visitors:
+                                self.tracks_with_face.add(track_id)
+                    except Exception as e:
+                        logger.warning(f"ReID recovery check failed for track {track_id}: {e}")
+
+                    # If not matched by ReID, process as truly new
+                    if not visitor_uuid:
+                        self.hourly_total_in += 1  # Truly new visitor entry
+                        if is_valid_face:
+                            # Extract Face Embedding
+                            face_bbox = faces[0][:4]
+                            fx1, fy1, fx2, fy2 = map(int, face_bbox)
+                            face_crop = person_crop[fy1:fy2, fx1:fx2]
+                            raw_embedding = self.arcface.extract(face_crop)
+                            embedding = normalize_embedding(raw_embedding)
+                            self.tracks_with_face.add(track_id)
                             
-                        self.unique_visitors.add(visitor_uuid)
-                    else:
-                        # Temporary tracking only (no valid face detected)
-                        visitor_uuid = uuid.uuid4()
-                        if self.use_db:
-                            self.db.insert_visitor(visitor_uuid, "body")
-                        logger.info(f"Temporary visitor tracked (No Face): {visitor_uuid}")
-                        
+                            # Search face in FAISS
+                            threshold = self.config['pipeline']['faiss_similarity_threshold']
+                            visitor_uuid, score = self.faiss.search(embedding, threshold=threshold)
+                            logger.info(f"New track FAISS search for track {track_id}: score = {score:.4f} (Threshold: {threshold})")
+                            
+                            if not visitor_uuid:
+                                # Register new face permanently
+                                visitor_uuid = uuid.uuid4()
+                                self.faiss.add_embedding(embedding, visitor_uuid)
+                                if self.use_db:
+                                    self.db.insert_visitor(visitor_uuid, "face")
+                                logger.info(f"New face visitor registered permanently: {visitor_uuid}")
+                            else:
+                                logger.info(f"Existing face visitor recognized: {visitor_uuid} (Score: {score:.2f})")
+                                
+                            self.unique_visitors.add(visitor_uuid)
+                        else:
+                            # Temporary tracking only (no valid face detected)
+                            visitor_uuid = uuid.uuid4()
+                            if self.use_db:
+                                self.db.insert_visitor(visitor_uuid, "body")
+                            logger.info(f"Temporary visitor tracked (No Face): {visitor_uuid}")
+                            
+                        # Save initial ReID embedding for future recoveries
+                        try:
+                            raw_reid = self.reid.extract(person_crop)
+                            reid_emb = normalize_embedding(raw_reid)
+                            self.reid_history[visitor_uuid] = reid_emb
+                        except Exception as e:
+                            logger.warning(f"Failed to extract initial ReID for track {track_id}: {e}")
+
                     if self.use_db:
                         self.db.log_event(visitor_uuid, camera_id="imx500")
                         self.db.update_live_track(track_id, visitor_uuid)
@@ -253,7 +307,7 @@ class UniquePersonCounter:
                     visitor_uuid = self.active_tracks.get(track_id, "Unknown")
                     
                     # State Machine: Green (Verified Face) vs Red (Tracking Only)
-                    if track_id in self.tracks_with_face:
+                    if track_id in self.tracks_with_face or visitor_uuid in self.unique_visitors:
                         color = (0, 255, 0) # Green (BGR)
                         label = f"ID: {track_id} | UUID: {str(visitor_uuid)[:8]} | Conf: {track.score:.2f}"
                     else:
@@ -303,6 +357,10 @@ class UniquePersonCounter:
                     # Sleep slightly if running headlessly to prevent high CPU utilization
                     time.sleep(0.01)
  
+                # Calculate exit count before updating active tracks
+                exited_ids = set(self.active_tracks.keys()) - active_ids
+                self.hourly_total_out += len(exited_ids)
+
                 # Cleanup stale DB and memory tracking states
                 self.active_tracks = {tid: uuid for tid, uuid in self.active_tracks.items() if tid in active_ids}
                 self.tracks_with_face = {tid for tid in self.tracks_with_face if tid in active_ids}
@@ -311,10 +369,52 @@ class UniquePersonCounter:
                 if self.use_db:
                     self.db.delete_stale_tracks()
 
+                # Sync hourly metrics to the database every 5 seconds
+                now_time = time.time()
+                if now_time - self.last_db_sync_time >= 5.0:
+                    self.sync_hourly_metrics()
+                    self.last_db_sync_time = now_time
+
         except KeyboardInterrupt:
             logger.info("Shutting down...")
         finally:
             self.camera.stop()
+
+    def sync_hourly_metrics(self):
+        if not self.use_db or not self.db:
+            return
+            
+        now = datetime.now()
+        # Check if the hour or day has shifted
+        if now.hour != self.current_hour or now.date() != self.current_date:
+            logger.info(f"Hour shifted from {self.current_hour} to {now.hour}. Resetting hourly metrics.")
+            self.hourly_total_in = 0
+            self.hourly_total_out = 0
+            self.hourly_peak_occupancy = 0
+            self.hourly_occupancy_samples = []
+            self.current_hour = now.hour
+            self.current_date = now.date()
+            
+        # Compute average occupancy
+        if self.hourly_occupancy_samples:
+            avg_occ = sum(self.hourly_occupancy_samples) / len(self.hourly_occupancy_samples)
+        else:
+            avg_occ = 0.0
+            
+        # Limit ReID history size to keep search fast
+        if len(self.reid_history) > 100:
+            oldest_keys = list(self.reid_history.keys())[:-100]
+            for k in oldest_keys:
+                self.reid_history.pop(k, None)
+                
+        # Upsert metrics to database
+        self.db.upsert_people_count_hourly(
+            camera_id=self.camera_id,
+            total_in=self.hourly_total_in,
+            total_out=self.hourly_total_out,
+            peak_occupancy=self.hourly_peak_occupancy,
+            avg_occupancy=avg_occ
+        )
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Unique Person Counting System")
