@@ -15,7 +15,7 @@ from detector.hailo_device import HailoDeviceManager
 from utils.logger import logger
 from utils.normalization import normalize_embedding
 import argparse
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import threading
 import time
 
@@ -164,7 +164,7 @@ class UniquePersonCounter:
     def run(self):
         # Start MJPEG HTTP server thread
         try:
-            server = HTTPServer(('0.0.0.0', self.stream_port), StreamingHandler)
+            server = ThreadingHTTPServer(('0.0.0.0', self.stream_port), StreamingHandler)
             server_thread = threading.Thread(target=server.serve_forever, daemon=True)
             server_thread.start()
             logger.info(f"MJPEG Stream server running at http://localhost:{self.stream_port}/stream")
