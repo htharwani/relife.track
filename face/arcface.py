@@ -14,13 +14,23 @@ class ArcFaceExtractor:
 
     def extract(self, face_crop):
         """
-        Extracts a 512-dimensional embedding from a face crop.
+        Extracts a stable 512-dimensional mock embedding from a face crop.
+        Uses a low-resolution 8x8 grid to capture stable color profiles robust to motion.
         Returns: np.ndarray of shape (512,)
         """
         import cv2
         try:
-            resized = cv2.resize(face_crop, (512, 1))
-            embedding = resized.astype(np.float32).mean(axis=2).flatten() / 255.0
+            # Resize to a very small grid (8x8) to capture stable color profiles
+            small = cv2.resize(face_crop, (8, 8))
+            # Flatten and normalize color values
+            feat = small.astype(np.float32).flatten() / 255.0
+            # L2 normalize the feature vector
+            norm = np.linalg.norm(feat)
+            if norm > 0:
+                feat = feat / norm
+            # Pad with zeros to fit 512 dimensions
+            embedding = np.zeros(512, dtype=np.float32)
+            embedding[:64] = feat
         except Exception:
             embedding = np.zeros(512, dtype=np.float32)
         return embedding
