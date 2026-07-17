@@ -36,8 +36,10 @@ class CameraStream:
         if self.picam2 is None:
             return False, None
         try:
-            # Capture the latest frame array from the continuous BGR stream directly
-            frame_bgr = self.picam2.capture_array()
+            # Capture the latest frame array
+            frame_raw = self.picam2.capture_array()
+            # Swap Red and Blue channels to fix the color swap bug
+            frame_bgr = cv2.cvtColor(frame_raw, cv2.COLOR_RGB2BGR)
             return True, frame_bgr
         except Exception as e:
             logger.error(f"Error reading frame from Picamera2: {e}")
