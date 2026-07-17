@@ -97,7 +97,12 @@ class UniquePersonCounter:
                         embedding_type = "body"
                         
                     # 5. Vector Search in FAISS
-                    visitor_uuid, score = self.faiss.search(embedding, threshold=self.config['pipeline']['faiss_similarity_threshold'])
+                    threshold = self.config['pipeline']['faiss_similarity_threshold']
+                    # Stricter threshold for mock body ReID color profiles to avoid mismatching similar clothes
+                    if embedding_type == "body":
+                        threshold = max(threshold, 0.90)
+                        
+                    visitor_uuid, score = self.faiss.search(embedding, threshold=threshold)
                     
                     if not visitor_uuid:
                         # Generate new UUID and store
@@ -107,7 +112,7 @@ class UniquePersonCounter:
                             self.db.insert_visitor(visitor_uuid, embedding_type)
                         logger.info(f"New visitor detected: {visitor_uuid} (Type: {embedding_type})")
                     else:
-                        logger.info(f"Existing visitor recognized: {visitor_uuid} (Score: {score:.2f})")
+                        logger.info(f"Existing visitor recognized: {visitor_uuid} (Score: {score:.2f}, Type: {embedding_type})")
                         
                     if self.use_db:
                         self.db.log_event(visitor_uuid, camera_id="imx500")
