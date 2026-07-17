@@ -21,4 +21,12 @@ class SCRFDDetector:
         # Simulated face detection output
         # If face found, return its local bounding box relative to img_crop
         faces = [] 
+        h, w = img_crop.shape[:2]
+        if h > 80 and w > 80:
+            # Simulate a face in the upper 10% to 45% region of the person crop
+            fx1 = int(w * 0.25)
+            fy1 = int(h * 0.10)
+            fx2 = int(w * 0.75)
+            fy2 = int(h * 0.45)
+            faces.append([fx1, fy1, fx2, fy2, 0.95])
         return faces
