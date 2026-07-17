@@ -110,6 +110,9 @@ class UniquePersonCounter:
         
         # Maps UUID to a stable ID for displaying
         self.uuid_to_stable_id = {}
+        
+        # Bounding box smoothing cache
+        self.smoothed_bboxes = {}
 
     def run(self):
         # Start MJPEG HTTP server thread
@@ -149,7 +152,27 @@ class UniquePersonCounter:
                 for track in tracked_objects:
                     track_id = track.track_id
                     active_ids.add(track_id)
-                    x1, y1, x2, y2 = map(int, track.tlbr)
+                    rx1, ry1, rx2, ry2 = map(int, track.tlbr)
+                    
+                    # Temporal smoothing using Exponential Moving Average (EMA)
+                    if track_id not in self.smoothed_bboxes:
+                        self.smoothed_bboxes[track_id] = [rx1, ry1, rx2, ry2]
+                    else:
+                        old_box = self.smoothed_bboxes[track_id]
+                        alpha = 0.60  # Smoothing factor (0.6 is very smooth but responsive)
+                        self.smoothed_bboxes[track_id] = [
+                            int(alpha * rx1 + (1 - alpha) * old_box[0]),
+                            int(alpha * ry1 + (1 - alpha) * old_box[1]),
+                            int(alpha * rx2 + (1 - alpha) * old_box[2]),
+                            int(alpha * ry2 + (1 - alpha) * old_box[3]),
+                        ]
+                        
+                    x1, y1, x2, y2 = self.smoothed_bboxes[track_id]
+                    # Safe clip to frame bounds
+                    x1 = max(0, x1)
+                    y1 = max(0, y1)
+                    x2 = min(frame.shape[1], x2)
+                    y2 = min(frame.shape[0], y2)
                     
                     person_crop = frame[y1:y2, x1:x2]
                     if person_crop.size == 0:
@@ -256,7 +279,7 @@ class UniquePersonCounter:
                                 best_reid_score = score
                                 best_reid_uuid = u
                                 
-                        if best_reid_score > 0.75:
+                        if best_reid_score > 0.60:
                             visitor_uuid = best_reid_uuid
                             logger.info(f"ReID Track Recovery for track {track_id}: matched with UUID {str(visitor_uuid)[:8]} (Score: {best_reid_score:.4f})")
                             self.reid_history[visitor_uuid] = reid_emb  # update cache
@@ -321,8 +344,13 @@ class UniquePersonCounter:
  
                 # Visualization: Draw bounding boxes and IDs
                 for track in tracked_objects:
-                    x1, y1, x2, y2 = map(int, track.tlbr)
                     track_id = track.track_id
+                    x1, y1, x2, y2 = self.smoothed_bboxes.get(track_id, map(int, track.tlbr))
+                    x1 = max(0, x1)
+                    y1 = max(0, y1)
+                    x2 = min(frame.shape[1], x2)
+                    y2 = min(frame.shape[0], y2)
+                    
                     visitor_uuid = self.active_tracks.get(track_id, "Unknown")
                     display_id = self.uuid_to_stable_id.get(visitor_uuid, track_id)
                     
@@ -385,6 +413,7 @@ class UniquePersonCounter:
                 self.active_tracks = {tid: uuid for tid, uuid in self.active_tracks.items() if tid in active_ids}
                 self.tracks_with_face = {tid for tid in self.tracks_with_face if tid in active_ids}
                 self.track_face_bbox = {tid: bbox for tid, bbox in self.track_face_bbox.items() if tid in active_ids}
+                self.smoothed_bboxes = {tid: box for tid, box in self.smoothed_bboxes.items() if tid in active_ids}
                 
                 if self.use_db:
                     self.db.delete_stale_tracks()

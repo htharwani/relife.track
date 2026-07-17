@@ -19,7 +19,7 @@ class CameraStream:
             self.picam2 = Picamera2()
             
             # Configure the camera for video stream
-            config = self.picam2.create_video_configuration(main={"size": (self.width, self.height), "format": "RGB888"})
+            config = self.picam2.create_video_configuration(main={"size": (self.width, self.height), "format": "BGR888"})
             self.picam2.configure(config)
             
             self.picam2.start()
@@ -31,15 +31,13 @@ class CameraStream:
         except Exception as e:
             logger.error(f"Failed to start Picamera2: {e}")
             raise
-
+ 
     def read_frame(self):
         if self.picam2 is None:
             return False, None
         try:
-            # Capture the latest frame array from the continuous stream
-            frame_rgb = self.picam2.capture_array()
-            # Convert RGB to BGR for OpenCV
-            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            # Capture the latest frame array from the continuous BGR stream directly
+            frame_bgr = self.picam2.capture_array()
             return True, frame_bgr
         except Exception as e:
             logger.error(f"Error reading frame from Picamera2: {e}")
