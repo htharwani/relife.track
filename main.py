@@ -126,6 +126,32 @@ class UniquePersonCounter:
         # Maps UUID to a stable ID for displaying
         self.uuid_to_stable_id = {}
         
+        # Load display IDs from database first (for consistency across restarts)
+        db_visitors = []
+        if self.use_db and self.db:
+            try:
+                rows = self.db.get_all_visitors()
+                for r in rows:
+                    u_str = r[0]
+                    u = uuid.UUID(str(u_str))
+                    db_visitors.append(u)
+            except Exception as e:
+                logger.warning(f"Could not load visitors from database at startup: {e}")
+                
+        # Pre-populate self.uuid_to_stable_id using sorted database visitors
+        for idx, u in enumerate(db_visitors):
+            self.uuid_to_stable_id[u] = idx + 1
+            
+        # Add any UUIDs from FAISS mapping that are not yet in the map
+        for u in self.faiss.uuid_mapping:
+            u_obj = uuid.UUID(str(u)) if isinstance(u, str) else u
+            if u_obj not in self.uuid_to_stable_id:
+                self.uuid_to_stable_id[u_obj] = len(self.uuid_to_stable_id) + 1
+                
+        # Finally, set the next display ID
+        self.next_display_id = len(self.uuid_to_stable_id) + 1
+        logger.info(f"Initialized stable display ID mapping: {len(self.uuid_to_stable_id)} profiles loaded. Next ID is {self.next_display_id}")
+        
         # Bounding box smoothing cache
         self.smoothed_bboxes = {}
 
@@ -153,7 +179,16 @@ class UniquePersonCounter:
                 
                 # Filter to only track 'person' class (COCO class ID 0)
                 if all_boxes.size > 0:
-                    boxes = all_boxes[all_boxes[:, 5] == 0]
+                    person_boxes = all_boxes[all_boxes[:, 5] == 0]
+                    valid_boxes = []
+                    for box in person_boxes:
+                        x1, y1, x2, y2 = box[:4]
+                        w = x2 - x1
+                        h = y2 - y1
+                        # Suppress flat false positives (pedestrians are taller than they are wide)
+                        if h >= w * 0.90:
+                            valid_boxes.append(box)
+                    boxes = np.array(valid_boxes) if valid_boxes else np.empty((0, 6))
                 else:
                     boxes = all_boxes
                 
@@ -290,7 +325,8 @@ class UniquePersonCounter:
                             
                         # Register initial stable display ID if not present
                         if visitor_uuid not in self.uuid_to_stable_id:
-                            self.uuid_to_stable_id[visitor_uuid] = track_id
+                            self.uuid_to_stable_id[visitor_uuid] = self.next_display_id
+                            self.next_display_id += 1
                             
                         # Update ReID history with current crop to adapt to angle/light shifts
                         try:
@@ -380,7 +416,8 @@ class UniquePersonCounter:
 
                     # Register display ID mapping
                     if visitor_uuid not in self.uuid_to_stable_id:
-                        self.uuid_to_stable_id[visitor_uuid] = track_id
+                        self.uuid_to_stable_id[visitor_uuid] = self.next_display_id
+                        self.next_display_id += 1
 
                     if self.use_db:
                         self.db.log_event(visitor_uuid, camera_id="imx500")

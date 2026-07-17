@@ -91,6 +91,16 @@ class PostgresClient:
         except Exception as e:
             logger.warning(f"Failed to check/initialize database schema: {e}")
 
+    def get_all_visitors(self):
+        query = "SELECT uuid, embedding_type FROM visitors ORDER BY first_seen ASC;"
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(query)
+                return cur.fetchall()
+        except Exception as e:
+            logger.error(f"Failed to fetch all visitors: {e}")
+            return []
+
     def insert_visitor(self, visitor_uuid, embedding_type):
         now = datetime.now()
         query = """
