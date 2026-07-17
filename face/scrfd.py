@@ -44,19 +44,19 @@ class SCRFDDetector:
             self.input_vstreams_params = InputVStreamParams.make_from_network_group(self.network_group, quantized=False, format_type=FormatType.FLOAT32)
             self.output_vstreams_params = OutputVStreamParams.make_from_network_group(self.network_group, quantized=False, format_type=FormatType.FLOAT32)
             
-        # Get input shape info
-        self.input_vstream_info = self.hef.get_input_vstream_infos()[0]
-        self.input_name = self.input_vstream_info.name
-        self.input_shape = self.input_vstream_info.shape
-        
-        # Get output stream info
-        self.output_vstream_infos = self.hef.get_output_vstream_infos()
-        logger.info(f"SCRFD Model loaded successfully on Hailo. Input shape: {self.input_shape}")
-        
-        self.is_mock = False
-    except Exception as e:
-        logger.error(f"Error loading SCRFD HEF model: {e}. Falling back to simulation mode.")
-        self.is_mock = True
+            # Get input shape info
+            self.input_vstream_info = self.hef.get_input_vstream_infos()[0]
+            self.input_name = self.input_vstream_info.name
+            self.input_shape = self.input_vstream_info.shape
+            
+            # Get output stream info
+            self.output_vstream_infos = self.hef.get_output_vstream_infos()
+            logger.info(f"SCRFD Model loaded successfully on Hailo. Input shape: {self.input_shape}")
+            
+            self.is_mock = False
+        except Exception as e:
+            logger.error(f"Error loading SCRFD HEF model: {e}. Falling back to simulation mode.")
+            self.is_mock = True
 
     def detect(self, img_crop, simulate=True):
         """
