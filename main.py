@@ -287,6 +287,7 @@ class UniquePersonCounter:
                         else:
                             logger.info(f"Face ignored for Track {track_id}: score = {face_score:.2f}, size = {fw}x{fh} (does not meet criteria)")
                             
+                    embedding = None
                     if is_valid_face:
                         face_bbox = faces[0][:4]
                         fx1, fy1, fx2, fy2 = map(int, face_bbox)
@@ -295,55 +296,58 @@ class UniquePersonCounter:
                         gx2 = min(frame.shape[1], x1 + fx2)
                         gy2 = min(frame.shape[0], y1 + fy2)
                         self.track_face_bbox[track_id] = (gx1, gy1, gx2, gy2)
+                        
+                        # Extract face embedding once
+                        face_crop = person_crop[fy1:fy2, fx1:fx2]
+                        try:
+                            raw_embedding = self.arcface.extract(face_crop)
+                            embedding = normalize_embedding(raw_embedding)
+                        except Exception as e:
+                            logger.warning(f"Failed to extract face embedding for Track {track_id}: {e}")
                     else:
                         self.track_face_bbox.pop(track_id, None)
                         
                     visitor_uuid = self.active_tracks[track_id]
                     
-                    # Upgrade track to face if face detected for the first time or if a significantly better face is seen
-                    if is_valid_face:
-                        face_bbox = faces[0][:4]
-                        fx1, fy1, fx2, fy2 = map(int, face_bbox)
-                        face_crop = person_crop[fy1:fy2, fx1:fx2]
-                        face_score = faces[0][4]
-                        
-                        best_prev_score = self.track_best_face_score.get(track_id, 0.0)
-                        
-                        # Only extract and register/update embedding if we haven't verified a face yet,
-                        # OR if the new face crop is significantly cleaner/closer (score > previous best + 0.05)
-                        if track_id not in self.tracks_with_face or face_score > best_prev_score + 0.05:
-                            raw_embedding = self.arcface.extract(face_crop)
-                            embedding = normalize_embedding(raw_embedding)
+                    # Process face verification and templates
+                    if is_valid_face and embedding is not None:
+                        if track_id not in self.tracks_with_face:
+                            thresh = self.config['pipeline']['faiss_similarity_threshold']
+                            matched_uuid, score = self.faiss.search(embedding, threshold=thresh)
+                            logger.info(f"Upgrade FAISS search for track {track_id}: score = {score:.4f} (Threshold: {thresh})")
                             
-                            if track_id not in self.tracks_with_face:
-                                thresh = self.config['pipeline']['faiss_similarity_threshold']
-                                matched_uuid, score = self.faiss.search(embedding, threshold=thresh)
-                                logger.info(f"Upgrade FAISS search for track {track_id}: score = {score:.4f} (Threshold: {thresh})")
-                                
-                                old_display_id = self.uuid_to_stable_id.get(visitor_uuid, track_id)
-                                if not matched_uuid:
-                                    new_uuid = uuid.uuid4()
-                                    self.faiss.add_embedding(embedding, new_uuid)
-                                    if self.use_db:
-                                        self.db.insert_visitor(new_uuid, "face")
-                                    logger.info(f"Upgraded track {track_id} to new face: {new_uuid}")
-                                    self.uuid_to_stable_id[new_uuid] = old_display_id
-                                    visitor_uuid = new_uuid
-                                else:
-                                    logger.info(f"Upgraded track {track_id} to existing face: {matched_uuid}")
-                                    if matched_uuid not in self.uuid_to_stable_id:
-                                        self.uuid_to_stable_id[matched_uuid] = old_display_id
-                                    visitor_uuid = matched_uuid
-                                    
-                                self.active_tracks[track_id] = visitor_uuid
-                                self.tracks_with_face.add(track_id)
-                                self.unique_visitors.add(visitor_uuid)
+                            old_display_id = self.uuid_to_stable_id.get(visitor_uuid, track_id)
+                            if not matched_uuid:
+                                new_uuid = uuid.uuid4()
+                                self.faiss.add_embedding(embedding, new_uuid)
+                                if self.use_db:
+                                    self.db.insert_visitor(new_uuid, "face")
+                                logger.info(f"Upgraded track {track_id} to new face: {new_uuid}")
+                                self.uuid_to_stable_id[new_uuid] = old_display_id
+                                visitor_uuid = new_uuid
                             else:
-                                # Track already verified, but this is a much cleaner face image! Update the embedding template.
-                                self.faiss.update_embedding(visitor_uuid, embedding)
-                                logger.info(f"Updated stored face template for visitor {visitor_uuid} with higher score: {face_score:.2f} (was {best_prev_score:.2f})")
+                                logger.info(f"Upgraded track {track_id} to existing face: {matched_uuid}")
+                                if matched_uuid not in self.uuid_to_stable_id:
+                                    self.uuid_to_stable_id[matched_uuid] = old_display_id
+                                visitor_uuid = matched_uuid
                                 
-                            self.track_best_face_score[track_id] = face_score
+                                # Add as additional template if similarity is moderate and template count < 3
+                                template_count = self.faiss.uuid_mapping.count(matched_uuid)
+                                if template_count < 3 and 0.55 <= score < 0.78:
+                                    self.faiss.add_embedding(embedding, matched_uuid)
+                                    logger.info(f"Added additional face template ({template_count+1}/3) for visitor UUID: {str(matched_uuid)[:8]} (Similarity score: {score:.2f})")
+                                    
+                            self.active_tracks[track_id] = visitor_uuid
+                            self.tracks_with_face.add(track_id)
+                            self.unique_visitors.add(visitor_uuid)
+                        else:
+                            # Track is already verified, check if we should add another template (e.g. walked closer)
+                            template_count = self.faiss.uuid_mapping.count(visitor_uuid)
+                            if template_count < 3:
+                                _, score = self.faiss.search(embedding, threshold=0.70)
+                                if 0.55 <= score < 0.78:
+                                    self.faiss.add_embedding(embedding, visitor_uuid)
+                                    logger.info(f"Added additional face template ({template_count+1}/3) for visitor UUID: {str(visitor_uuid)[:8]} (Similarity score: {score:.2f})")
                         
                     if visitor_uuid not in self.uuid_to_stable_id:
                         self.uuid_to_stable_id[visitor_uuid] = self.next_display_id
@@ -463,28 +467,45 @@ class UniquePersonCounter:
                             face_crop = person_crop[fy1:fy2, fx1:fx2]
                             face_score = faces[0][4]
                             
-                            raw_embedding = self.arcface.extract(face_crop)
-                            embedding = normalize_embedding(raw_embedding)
-                            self.tracks_with_face.add(track_id)
-                            self.track_best_face_score[track_id] = face_score
-                            
-                            # Search face in FAISS
-                            threshold = self.config['pipeline']['faiss_similarity_threshold']
-                            matched_uuid, score = self.faiss.search(embedding, threshold=threshold)
-                            logger.info(f"New track FAISS search for track {track_id}: score = {score:.4f} (Threshold: {threshold})")
-                            
-                            if not matched_uuid:
-                                # Register new face permanently
-                                visitor_uuid = uuid.uuid4()
-                                self.faiss.add_embedding(embedding, visitor_uuid)
-                                if self.use_db:
-                                    self.db.insert_visitor(visitor_uuid, "face")
-                                logger.info(f"New face visitor registered permanently: {visitor_uuid}")
-                            else:
-                                visitor_uuid = matched_uuid
-                                logger.info(f"Existing face visitor recognized: {visitor_uuid} (Score: {score:.2f})")
+                            try:
+                                raw_embedding = self.arcface.extract(face_crop)
+                                embedding = normalize_embedding(raw_embedding)
+                            except Exception as e:
+                                logger.warning(f"Failed to extract face embedding: {e}")
+                                embedding = None
                                 
-                            self.unique_visitors.add(visitor_uuid)
+                            if embedding is not None:
+                                self.tracks_with_face.add(track_id)
+                                self.track_best_face_score[track_id] = face_score
+                                
+                                # Search face in FAISS
+                                threshold = self.config['pipeline']['faiss_similarity_threshold']
+                                matched_uuid, score = self.faiss.search(embedding, threshold=threshold)
+                                logger.info(f"New track FAISS search for track {track_id}: score = {score:.4f} (Threshold: {threshold})")
+                                
+                                if not matched_uuid:
+                                    # Register new face permanently
+                                    visitor_uuid = uuid.uuid4()
+                                    self.faiss.add_embedding(embedding, visitor_uuid)
+                                    if self.use_db:
+                                        self.db.insert_visitor(visitor_uuid, "face")
+                                    logger.info(f"New face visitor registered permanently: {visitor_uuid}")
+                                else:
+                                    visitor_uuid = matched_uuid
+                                    logger.info(f"Existing face visitor recognized: {visitor_uuid} (Score: {score:.2f})")
+                                    
+                                    # Add as additional template if similarity is moderate and template count < 3
+                                    template_count = self.faiss.uuid_mapping.count(matched_uuid)
+                                    if template_count < 3 and 0.55 <= score < 0.78:
+                                        self.faiss.add_embedding(embedding, matched_uuid)
+                                        logger.info(f"Added additional face template ({template_count+1}/3) for visitor UUID: {str(matched_uuid)[:8]} (Similarity score: {score:.2f})")
+                                        
+                                self.unique_visitors.add(visitor_uuid)
+                            else:
+                                # Fallback if embedding extraction fails
+                                visitor_uuid = uuid.uuid4()
+                                if self.use_db:
+                                    self.db.insert_visitor(visitor_uuid, "body")
                         else:
                             # Temporary tracking only (no valid face detected)
                             visitor_uuid = uuid.uuid4()
