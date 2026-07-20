@@ -116,6 +116,7 @@ class UniquePersonCounter:
         self.hourly_total_out = 0
         self.hourly_peak_occupancy = 0
         self.hourly_occupancy_samples = []
+        self.hourly_logged_in_uuids = set()
         self.current_hour = datetime.now().hour
         self.current_date = datetime.now().date()
         self.last_db_sync_time = 0
@@ -484,7 +485,6 @@ class UniquePersonCounter:
                         
                     # If not matched by ReID, process as truly new
                     if not visitor_uuid:
-                        self.hourly_total_in += 1  # Truly new visitor entry
                         if is_valid_face:
                             # Extract Face Embedding
                             face_bbox = faces[0][:4]
@@ -529,13 +529,9 @@ class UniquePersonCounter:
                             else:
                                 # Fallback if embedding extraction fails
                                 visitor_uuid = uuid.uuid4()
-                                if self.use_db:
-                                    self.db.insert_visitor(visitor_uuid, "body")
                         else:
                             # Temporary tracking only (no valid face detected)
                             visitor_uuid = uuid.uuid4()
-                            if self.use_db:
-                                self.db.insert_visitor(visitor_uuid, "body")
                             logger.info(f"Temporary visitor tracked (No Face): {visitor_uuid}")
                             
                         # Save initial ReID embedding for future recoveries
@@ -554,7 +550,8 @@ class UniquePersonCounter:
                     self.reid_last_seen[visitor_uuid] = time.time()
 
                     if self.use_db:
-                        self.db.log_event(visitor_uuid, camera_id="imx500")
+                        if visitor_uuid in self.unique_visitors:
+                            self.db.log_event(visitor_uuid, camera_id="imx500")
                         self.db.update_live_track(track_id, visitor_uuid)
                         
                     self.active_tracks[track_id] = visitor_uuid
@@ -596,7 +593,7 @@ class UniquePersonCounter:
                 cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
  
                 # Draw the unique visitor metrics text on top of the overlay
-                cv2.putText(frame, f"Unique (Session): {len(self.unique_visitors)}", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
+                cv2.putText(frame, f"Unique (Hourly): {self.hourly_total_in}", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
                 cv2.putText(frame, f"Total Registered: {len(self.faiss.uuid_mapping)}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
                 sim_status = "ON" if self.simulate_face else "OFF (Backside)"
                 cv2.putText(frame, f"Face Sim (Press 'F'): {sim_status}", (20, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
@@ -622,16 +619,28 @@ class UniquePersonCounter:
                     # Sleep slightly if running headlessly to prevent high CPU utilization
                     time.sleep(0.01)
  
-                # Calculate exit count before updating active tracks
-                exited_ids = set(self.active_tracks.keys()) - active_ids
-                self.hourly_total_out += len(exited_ids)
-
                 # Cleanup stale DB and memory tracking states
                 self.active_tracks = {tid: uuid for tid, uuid in self.active_tracks.items() if tid in active_ids}
                 self.tracks_with_face = {tid for tid in self.tracks_with_face if tid in active_ids}
                 self.track_face_bbox = {tid: bbox for tid, bbox in self.track_face_bbox.items() if tid in active_ids}
                 self.smoothed_bboxes = {tid: box for tid, box in self.smoothed_bboxes.items() if tid in active_ids}
                 self.track_best_face_score = {tid: score for tid, score in self.track_best_face_score.items() if tid in active_ids}
+
+                # Check if hour shifted and reset metrics if needed
+                self.check_hour_shift()
+
+                # Update live occupancy and hourly IN metrics per unique visitor UUID (OUT remains 0)
+                current_active_uuids = set(self.active_tracks.values())
+                current_occ = len(current_active_uuids)
+                if current_occ > self.hourly_peak_occupancy:
+                    self.hourly_peak_occupancy = current_occ
+                self.hourly_occupancy_samples.append(current_occ)
+
+                # Log IN count strictly for CONFIRMED unique visitors (face registered)
+                for u in self.unique_visitors:
+                    if u not in self.hourly_logged_in_uuids:
+                        self.hourly_total_in += 1
+                        self.hourly_logged_in_uuids.add(u)
                 
                 if self.use_db:
                     self.db.delete_stale_tracks()
@@ -647,20 +656,23 @@ class UniquePersonCounter:
         finally:
             self.camera.stop()
 
-    def sync_hourly_metrics(self):
-        if not self.use_db or not self.db:
-            return
-            
+    def check_hour_shift(self):
         now = datetime.now()
-        # Check if the hour or day has shifted
         if now.hour != self.current_hour or now.date() != self.current_date:
             logger.info(f"Hour shifted from {self.current_hour} to {now.hour}. Resetting hourly metrics.")
             self.hourly_total_in = 0
             self.hourly_total_out = 0
             self.hourly_peak_occupancy = 0
             self.hourly_occupancy_samples = []
+            self.hourly_logged_in_uuids.clear()
             self.current_hour = now.hour
             self.current_date = now.date()
+
+    def sync_hourly_metrics(self):
+        if not self.use_db or not self.db:
+            return
+            
+        self.check_hour_shift()
             
         # Compute average occupancy
         if self.hourly_occupancy_samples:
