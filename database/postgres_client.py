@@ -190,7 +190,7 @@ class PostgresClient:
             return
         query = """
         DELETE FROM live_tracks 
-        WHERE last_updated < NOW() - INTERVAL '%s seconds';
+        WHERE last_updated < NOW() - (%s * INTERVAL '1 second');
         """
         try:
             with self.conn.cursor() as cur:
