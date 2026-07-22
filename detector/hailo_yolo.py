@@ -31,7 +31,9 @@ class HailoYOLODetector:
         self.network_group_params = self.network_group.create_params()
         
         # Create input and output stream parameters using proper FormatType Enum
-        self.input_vstreams_params = InputVStreamParams.make_from_network_group(self.network_group, quantized=False, format_type=FormatType.FLOAT32)
+        # CHANGED: quantized=True, FormatType.UINT8 (was quantized=False, FLOAT32)
+        # This lets HailoRT use native int8 I/O so it doesn't quantize/dequantize every frame.
+        self.input_vstreams_params = InputVStreamParams.make_from_network_group(self.network_group, quantized=True, format_type=FormatType.UINT8)
         self.output_vstreams_params = OutputVStreamParams.make_from_network_group(self.network_group, quantized=False, format_type=FormatType.FLOAT32)
         
         # Set up persistent context for Network Group and InferVStreams
@@ -67,8 +69,8 @@ class HailoYOLODetector:
             input_h, input_w = self.input_shape[0], self.input_shape[1]
             
         resized = cv2.resize(frame, (input_w, input_h))
-        # Ensure array is contiguous and formatted as expected by Hailo
-        input_data = {self.input_name: np.expand_dims(resized, axis=0).astype(np.float32)}
+        # CHANGED: dtype is now uint8 (was float32), to match quantized=True vstreams above.
+        input_data = {self.input_name: np.expand_dims(resized, axis=0).astype(np.uint8)}
         
         # 2. Inference
         infer_results = self.infer_pipeline.infer(input_data)
