@@ -3,7 +3,7 @@ import uuid
 import numpy as np
 from datetime import datetime
 from config.config_manager import ConfigManager
-from database.postgres_client import PostgresClient
+from database.async_postgres_client import AsyncPostgresClient as PostgresClient
 from vector_db.vector_store import VectorStore
 from camera.stream import CameraStream
 from detector.hailo_yolo import HailoYOLODetector
@@ -604,9 +604,13 @@ class UniquePersonCounter:
                             else:
                                 # Fallback if embedding extraction fails
                                 visitor_uuid = uuid.uuid4()
+                                if self.use_db:
+                                    self.db.insert_visitor(visitor_uuid, "body")
                         else:
                             # Temporary tracking only (no valid face detected)
                             visitor_uuid = uuid.uuid4()
+                            if self.use_db:
+                                self.db.insert_visitor(visitor_uuid, "body")
                             logger.info(f"Temporary visitor tracked (No Face): {visitor_uuid}")
                             
                         # Save initial ReID embedding for future recoveries

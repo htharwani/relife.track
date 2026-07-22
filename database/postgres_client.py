@@ -1,4 +1,5 @@
 import psycopg2
+from psycopg2 import OperationalError, InterfaceError
 from psycopg2.extras import RealDictCursor
 from utils.logger import logger
 import uuid
@@ -26,6 +27,11 @@ class PostgresClient:
         self.conn = None
         self.connect()
         self._initialize_schema()
+
+    def _handle_db_error(self, e, context_message):
+        logger.error(f"{context_message}: {e}")
+        if isinstance(e, (OperationalError, InterfaceError)) or (self.conn is None or self.conn.closed):
+            self.reconnect()
 
     def connect(self):
         env_vars = load_env_file()
@@ -118,8 +124,7 @@ class PostgresClient:
                 cur.execute(query)
                 return cur.fetchall()
         except Exception as e:
-            logger.error(f"Failed to fetch all visitors: {e}")
-            self.reconnect()
+            self._handle_db_error(e, "Failed to fetch all visitors")
             return []
 
     def insert_visitor(self, visitor_uuid, embedding_type):
@@ -136,8 +141,7 @@ class PostgresClient:
             with self.conn.cursor() as cur:
                 cur.execute(query, (str(visitor_uuid), now, now, embedding_type))
         except Exception as e:
-            logger.error(f"Failed to insert visitor: {e}")
-            self.reconnect()
+            self._handle_db_error(e, "Failed to insert visitor")
 
     def update_visitor_last_seen(self, visitor_uuid):
         if not self.conn:
@@ -148,8 +152,7 @@ class PostgresClient:
             with self.conn.cursor() as cur:
                 cur.execute(query, (now, str(visitor_uuid)))
         except Exception as e:
-            logger.error(f"Failed to update visitor last seen: {e}")
-            self.reconnect()
+            self._handle_db_error(e, "Failed to update visitor last seen")
 
     def log_event(self, visitor_uuid, camera_id="camera_1"):
         if not self.conn:
@@ -163,8 +166,7 @@ class PostgresClient:
             with self.conn.cursor() as cur:
                 cur.execute(query, (str(visitor_uuid), now, camera_id))
         except Exception as e:
-            logger.error(f"Failed to log event: {e}")
-            self.reconnect()
+            self._handle_db_error(e, "Failed to log event")
 
     def update_live_track(self, track_id, visitor_uuid):
         if not self.conn:
@@ -181,8 +183,7 @@ class PostgresClient:
             with self.conn.cursor() as cur:
                 cur.execute(query, (track_id, str(visitor_uuid), now))
         except Exception as e:
-            logger.error(f"Failed to update live track: {e}")
-            self.reconnect()
+            self._handle_db_error(e, "Failed to update live track")
             
     def delete_stale_tracks(self, timeout_seconds=60):
         if not self.conn:
@@ -195,8 +196,7 @@ class PostgresClient:
             with self.conn.cursor() as cur:
                 cur.execute(query, (timeout_seconds,))
         except Exception as e:
-            logger.error(f"Failed to delete stale tracks: {e}")
-            self.reconnect()
+            self._handle_db_error(e, "Failed to delete stale tracks")
 
     def upsert_people_count_hourly(self, camera_id, total_in, total_out, peak_occupancy, avg_occupancy):
         if not self.conn:
@@ -237,5 +237,4 @@ class PostgresClient:
                     """
                     cur.execute(insert_query, (camera_id, report_date, report_hour, total_in, total_out, peak_occupancy, float(avg_occupancy), now))
         except Exception as e:
-            logger.error(f"Failed to upsert hourly metrics: {e}")
-            self.reconnect()
+            self._handle_db_error(e, "Failed to upsert hourly metrics")
