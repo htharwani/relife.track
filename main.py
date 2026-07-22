@@ -298,9 +298,6 @@ class UniquePersonCounter:
                     
                     # Throttle face detection based on whether the track already has a verified face
                     visitor_uuid = self.active_tracks[track_id]
-                    if visitor_uuid in self.verified_face_uuids:
-                        self.tracks_with_face.add(track_id)
-                        
                     if track_id in self.tracks_with_face:
                         if track_id not in self.track_relative_face_bbox:
                             # Active face searching: if verified (e.g. recovered via ReID) but missing face box coordinates,
@@ -315,8 +312,13 @@ class UniquePersonCounter:
                                 # Stop face detection completely for this track once 3 templates are verified
                                 run_face_detection = False
                     else:
-                        # For unverified tracks, run face detection once every 5 frames to reduce NPU load
-                        run_face_detection = ((self.frame_count + track_id) % 5 == 0)
+                        # For unverified tracks:
+                        if visitor_uuid in self.verified_face_uuids:
+                            # Run detection frequently (every 2 frames) to confirm their face immediately
+                            run_face_detection = ((self.frame_count + track_id) % 2 == 0)
+                        else:
+                            # Run once every 5 frames to reduce NPU load
+                            run_face_detection = ((self.frame_count + track_id) % 5 == 0)
                     
                     faces = []
                     is_valid_face = False
@@ -398,9 +400,10 @@ class UniquePersonCounter:
 
                     # Process face verification and templates
                     if is_valid_face and embedding is not None:
+                        thresh = self.config['pipeline']['faiss_similarity_threshold']
+                        matched_uuid, score = self.faiss.search(embedding, threshold=thresh)
+                        
                         if track_id not in self.tracks_with_face:
-                            thresh = self.config['pipeline']['faiss_similarity_threshold']
-                            matched_uuid, score = self.faiss.search(embedding, threshold=thresh)
                             logger.info(f"Upgrade FAISS search for track {track_id}: score = {score:.4f} (Threshold: {thresh})")
                             
                             if visitor_uuid in self.uuid_to_stable_id:
@@ -436,13 +439,38 @@ class UniquePersonCounter:
                             self.verified_face_uuids.add(visitor_uuid)
                             self.unique_visitors.add(visitor_uuid)
                         else:
-                            # Track is already verified, check if we should add another template (e.g. walked closer)
-                            template_count = self.faiss.uuid_mapping.count(visitor_uuid)
-                            if template_count < 3:
-                                _, score = self.faiss.search(embedding, threshold=0.70)
-                                if 0.55 <= score < 0.78:
-                                    self.faiss.add_embedding(embedding, visitor_uuid)
-                                    logger.info(f"Added additional face template ({template_count+1}/3) for visitor UUID: {str(visitor_uuid)[:8]} (Similarity score: {score:.2f})")
+                            # Track is already verified (green), but let's check if the face matches a different registered visitor.
+                            # This corrects ReID recovery errors (false matches).
+                            if matched_uuid and matched_uuid != visitor_uuid:
+                                if matched_uuid not in assigned_uuids:
+                                    logger.info(f"Correcting identity of track {track_id} from {str(visitor_uuid)[:8]} to matched face {str(matched_uuid)[:8]} (Score: {score:.2f})")
+                                    visitor_uuid = matched_uuid
+                                    self.active_tracks[track_id] = visitor_uuid
+                                    self.verified_face_uuids.add(visitor_uuid)
+                            elif not matched_uuid:
+                                # Face does not match the current visitor_uuid or any other visitor in FAISS (score was low).
+                                # To verify this, we run a looser search to see if they are completely different.
+                                # If the top score is extremely low (e.g. < 0.45), they are definitely a different person.
+                                _, top_score = self.faiss.search(embedding, threshold=0.0)
+                                if top_score < 0.45:
+                                    # Create a new unique visitor for this track to correct the ReID error
+                                    new_uuid = uuid.uuid4()
+                                    self.faiss.add_embedding(embedding, new_uuid)
+                                    if self.use_db:
+                                        self.db.insert_visitor(new_uuid, "face")
+                                    logger.info(f"Correcting identity of track {track_id} from false ReID match {str(visitor_uuid)[:8]} to new face {str(new_uuid)[:8]} (Similarity to templates: {top_score:.2f})")
+                                    visitor_uuid = new_uuid
+                                    self.active_tracks[track_id] = visitor_uuid
+                                    self.verified_face_uuids.add(visitor_uuid)
+                                    self.unique_visitors.add(visitor_uuid)
+                                    
+                            # Keep template count update for verified face
+                            if visitor_uuid == matched_uuid:
+                                template_count = self.faiss.uuid_mapping.count(visitor_uuid)
+                                if template_count < 3:
+                                    if 0.55 <= score < 0.78:
+                                        self.faiss.add_embedding(embedding, visitor_uuid)
+                                        logger.info(f"Added additional face template ({template_count+1}/3) for visitor UUID: {str(visitor_uuid)[:8]} (Similarity score: {score:.2f})")
                         
                     if visitor_uuid not in self.uuid_to_stable_id:
                         self.uuid_to_stable_id[visitor_uuid] = self.next_display_id
@@ -673,9 +701,6 @@ class UniquePersonCounter:
                     self.reid_last_seen[visitor_uuid] = time.time()
                     assigned_uuids.add(visitor_uuid)
  
-                    if visitor_uuid in self.verified_face_uuids:
-                        self.tracks_with_face.add(track_id)
-                        
                     self.active_tracks[track_id] = visitor_uuid
                     if self.use_db:
                         if visitor_uuid in self.unique_visitors:
