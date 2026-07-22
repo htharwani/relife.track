@@ -403,7 +403,11 @@ class UniquePersonCounter:
                             matched_uuid, score = self.faiss.search(embedding, threshold=thresh)
                             logger.info(f"Upgrade FAISS search for track {track_id}: score = {score:.4f} (Threshold: {thresh})")
                             
-                            old_display_id = self.uuid_to_stable_id.get(visitor_uuid, track_id)
+                            if visitor_uuid in self.uuid_to_stable_id:
+                                old_display_id = self.uuid_to_stable_id[visitor_uuid]
+                            else:
+                                old_display_id = self.next_display_id
+                                self.next_display_id += 1
                             # Double-assignment prevention for matched face
                             if not matched_uuid or matched_uuid in assigned_uuids:
                                 if matched_uuid:
@@ -769,11 +773,12 @@ class UniquePersonCounter:
                     self.hourly_peak_occupancy = current_occ
                 self.hourly_occupancy_samples.append(current_occ)
 
-                # Log IN count strictly for CONFIRMED unique visitors (face registered)
-                for u in self.unique_visitors:
-                    if u not in self.hourly_logged_in_uuids:
-                        self.hourly_total_in += 1
-                        self.hourly_logged_in_uuids.add(u)
+                # Log IN count strictly for CONFIRMED unique visitors active in the current frame
+                for track_id, u in self.active_tracks.items():
+                    if track_id in self.tracks_with_face:
+                        if u not in self.hourly_logged_in_uuids:
+                            self.hourly_total_in += 1
+                            self.hourly_logged_in_uuids.add(u)
 
                 # Sync hourly metrics and cleanup database live_tracks every 5 seconds
                 now_time = time.time()
