@@ -290,11 +290,14 @@ class UniquePersonCounter:
                     if track_id in self.tracks_with_face:
                         template_count = self.faiss.uuid_mapping.count(visitor_uuid)
                         if template_count < 3:
-                            run_face_detection = ((self.frame_count + track_id) % 15 == 0)
+                            # Run face detection very slowly (every 60 frames) to check for better templates
+                            run_face_detection = ((self.frame_count + track_id) % 60 == 0)
                         else:
-                            run_face_detection = ((self.frame_count + track_id) % 30 == 0)
+                            # Stop face detection completely for this track once 3 templates are verified
+                            run_face_detection = False
                     else:
-                        run_face_detection = ((self.frame_count + track_id) % 2 == 0)
+                        # For unverified tracks, run face detection once every 5 frames to reduce NPU load
+                        run_face_detection = ((self.frame_count + track_id) % 5 == 0)
                     
                     faces = []
                     is_valid_face = False
@@ -321,9 +324,9 @@ class UniquePersonCounter:
                                     lx, _ = landmarks[0][:2]
                                     rx, _ = landmarks[1][:2]
                                     eye_dist = abs(lx - rx)
-                                    if eye_dist < fw * 0.22:
+                                    if eye_dist < fw * 0.15:  # Relaxed from 0.22 to 0.15
                                         is_frontal = False
-                                        logger.info(f"Face ignored for Track {track_id}: rejected as profile/side-view (eye distance = {eye_dist:.1f} < {fw*0.22:.1f})")
+                                        logger.info(f"Face ignored for Track {track_id}: rejected as profile/side-view (eye distance = {eye_dist:.1f} < {fw*0.15:.1f})")
                                         
                                 if is_frontal:
                                     is_valid_face = True
@@ -466,8 +469,8 @@ class UniquePersonCounter:
                     person_w = x2 - x1
                     is_close_enough = (person_h >= 80)
                     
-                    # Throttle face detection for new tracks to once every 2 frames
-                    run_face_detection = ((self.frame_count + track_id) % 2 == 0)
+                    # Throttle face detection for new tracks to once every 5 frames
+                    run_face_detection = ((self.frame_count + track_id) % 5 == 0)
                     
                     faces = []
                     is_valid_face = False
@@ -492,9 +495,9 @@ class UniquePersonCounter:
                                 lx, _ = landmarks[0][:2]
                                 rx, _ = landmarks[1][:2]
                                 eye_dist = abs(lx - rx)
-                                if eye_dist < fw * 0.22:
+                                if eye_dist < fw * 0.15:  # Relaxed from 0.22 to 0.15
                                     is_frontal = False
-                                    logger.info(f"Face ignored for Track {track_id}: rejected as profile/side-view (eye distance = {eye_dist:.1f} < {fw*0.22:.1f})")
+                                    logger.info(f"Face ignored for Track {track_id}: rejected as profile/side-view (eye distance = {eye_dist:.1f} < {fw*0.15:.1f})")
                                     
                             if is_frontal:
                                 is_valid_face = True
