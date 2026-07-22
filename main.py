@@ -127,6 +127,9 @@ class UniquePersonCounter:
         # Maps UUID to a stable ID for displaying
         self.uuid_to_stable_id = {}
         
+        # Set of UUIDs that have verified faces
+        self.verified_face_uuids = set()
+        
         # Load display IDs from database first (for consistency across restarts)
         db_visitors = []
         if self.use_db and self.db:
@@ -134,8 +137,11 @@ class UniquePersonCounter:
                 rows = self.db.get_all_visitors()
                 for r in rows:
                     u_str = r[0]
+                    emb_type = r[1] if len(r) > 1 else "face"
                     u = uuid.UUID(str(u_str))
                     db_visitors.append(u)
+                    if emb_type == "face":
+                        self.verified_face_uuids.add(u)
             except Exception as e:
                 logger.warning(f"Could not load visitors from database at startup: {e}")
                 
@@ -146,6 +152,7 @@ class UniquePersonCounter:
         # Add any UUIDs from FAISS mapping that are not yet in the map
         for u in self.faiss.uuid_mapping:
             u_obj = uuid.UUID(str(u)) if isinstance(u, str) else u
+            self.verified_face_uuids.add(u_obj)
             if u_obj not in self.uuid_to_stable_id:
                 self.uuid_to_stable_id[u_obj] = len(self.uuid_to_stable_id) + 1
                 
@@ -204,6 +211,9 @@ class UniquePersonCounter:
                         x1, y1, x2, y2 = box[:4]
                         w = x2 - x1
                         h = y2 - y1
+                        # Suppress giant false positives (taking up more than 85% of frame width/height)
+                        if w > frame.shape[1] * 0.85 or h > frame.shape[0] * 0.85:
+                            continue
                         # Suppress flat false positives (pedestrians are taller than they are wide)
                         if h >= w * 0.90:
                             valid_boxes.append(box)
@@ -243,6 +253,7 @@ class UniquePersonCounter:
                 
                 # Tracks active in the current frame
                 active_ids = set()
+                assigned_uuids = set()
                 
                 # Split tracked_objects into existing tracks and new tracks
                 existing_tracks = []
@@ -287,14 +298,22 @@ class UniquePersonCounter:
                     
                     # Throttle face detection based on whether the track already has a verified face
                     visitor_uuid = self.active_tracks[track_id]
+                    if visitor_uuid in self.verified_face_uuids:
+                        self.tracks_with_face.add(track_id)
+                        
                     if track_id in self.tracks_with_face:
-                        template_count = self.faiss.uuid_mapping.count(visitor_uuid)
-                        if template_count < 3:
-                            # Run face detection very slowly (every 60 frames) to check for better templates
-                            run_face_detection = ((self.frame_count + track_id) % 60 == 0)
+                        if track_id not in self.track_relative_face_bbox:
+                            # Active face searching: if verified (e.g. recovered via ReID) but missing face box coordinates,
+                            # run detection frequently (every 2 frames) until we capture a face and cache relative coordinates.
+                            run_face_detection = ((self.frame_count + track_id) % 2 == 0)
                         else:
-                            # Stop face detection completely for this track once 3 templates are verified
-                            run_face_detection = False
+                            template_count = self.faiss.uuid_mapping.count(visitor_uuid)
+                            if template_count < 3:
+                                # Run face detection very slowly (every 60 frames) to check for better templates
+                                run_face_detection = ((self.frame_count + track_id) % 60 == 0)
+                            else:
+                                # Stop face detection completely for this track once 3 templates are verified
+                                run_face_detection = False
                     else:
                         # For unverified tracks, run face detection once every 5 frames to reduce NPU load
                         run_face_detection = ((self.frame_count + track_id) % 5 == 0)
@@ -369,6 +388,14 @@ class UniquePersonCounter:
                         
                     visitor_uuid = self.active_tracks[track_id]
                     
+                    # Double-assignment prevention: if the assigned visitor_uuid is already active,
+                    # resolve the conflict by generating a new temporary visitor UUID
+                    if visitor_uuid in assigned_uuids:
+                        visitor_uuid = uuid.uuid4()
+                        if self.use_db:
+                            self.db.insert_visitor(visitor_uuid, "body")
+                        self.active_tracks[track_id] = visitor_uuid
+
                     # Process face verification and templates
                     if is_valid_face and embedding is not None:
                         if track_id not in self.tracks_with_face:
@@ -377,7 +404,10 @@ class UniquePersonCounter:
                             logger.info(f"Upgrade FAISS search for track {track_id}: score = {score:.4f} (Threshold: {thresh})")
                             
                             old_display_id = self.uuid_to_stable_id.get(visitor_uuid, track_id)
-                            if not matched_uuid:
+                            # Double-assignment prevention for matched face
+                            if not matched_uuid or matched_uuid in assigned_uuids:
+                                if matched_uuid:
+                                    logger.info(f"FAISS match {str(matched_uuid)[:8]} ignored for track {track_id} because UUID is already active in frame.")
                                 new_uuid = uuid.uuid4()
                                 self.faiss.add_embedding(embedding, new_uuid)
                                 if self.use_db:
@@ -399,6 +429,7 @@ class UniquePersonCounter:
                                     
                             self.active_tracks[track_id] = visitor_uuid
                             self.tracks_with_face.add(track_id)
+                            self.verified_face_uuids.add(visitor_uuid)
                             self.unique_visitors.add(visitor_uuid)
                         else:
                             # Track is already verified, check if we should add another template (e.g. walked closer)
@@ -424,6 +455,7 @@ class UniquePersonCounter:
                         
                     # Mark profile active now
                     self.reid_last_seen[visitor_uuid] = time.time()
+                    assigned_uuids.add(visitor_uuid)
                     
                     if self.use_db:
                         now = time.time()
@@ -552,9 +584,13 @@ class UniquePersonCounter:
                                     
                             reid_thresh = self.config['pipeline'].get('reid_threshold', 0.65)
                             if best_reid_score > reid_thresh:
-                                visitor_uuid = best_reid_uuid
-                                logger.info(f"ReID Track Recovery for track {track_id}: matched with UUID {str(visitor_uuid)[:8]} (Score: {best_reid_score:.4f}, Threshold: {reid_thresh})")
-                                self.reid_history[visitor_uuid] = reid_emb  # update cache
+                                # Double-assignment prevention for ReID
+                                if best_reid_uuid not in assigned_uuids:
+                                    visitor_uuid = best_reid_uuid
+                                    logger.info(f"ReID Track Recovery for track {track_id}: matched with UUID {str(visitor_uuid)[:8]} (Score: {best_reid_score:.4f}, Threshold: {reid_thresh})")
+                                    self.reid_history[visitor_uuid] = reid_emb  # update cache
+                                else:
+                                    logger.info(f"ReID match {str(best_reid_uuid)[:8]} ignored for track {track_id} because UUID is already active in frame.")
                         except Exception as e:
                             logger.warning(f"ReID recovery check failed for track {track_id}: {e}")
                         
@@ -583,7 +619,10 @@ class UniquePersonCounter:
                                 matched_uuid, score = self.faiss.search(embedding, threshold=threshold)
                                 logger.info(f"New track FAISS search for track {track_id}: score = {score:.4f} (Threshold: {threshold})")
                                 
-                                if not matched_uuid:
+                                # Double-assignment prevention for matched face
+                                if not matched_uuid or matched_uuid in assigned_uuids:
+                                    if matched_uuid:
+                                        logger.info(f"FAISS match {str(matched_uuid)[:8]} ignored for track {track_id} because UUID is already active in frame.")
                                     # Register new face permanently
                                     visitor_uuid = uuid.uuid4()
                                     self.faiss.add_embedding(embedding, visitor_uuid)
@@ -601,6 +640,7 @@ class UniquePersonCounter:
                                         logger.info(f"Added additional face template ({template_count+1}/3) for visitor UUID: {str(matched_uuid)[:8]} (Similarity score: {score:.2f})")
                                         
                                 self.unique_visitors.add(visitor_uuid)
+                                self.verified_face_uuids.add(visitor_uuid)
                             else:
                                 # Fallback if embedding extraction fails
                                 visitor_uuid = uuid.uuid4()
@@ -627,7 +667,11 @@ class UniquePersonCounter:
                         self.next_display_id += 1
  
                     self.reid_last_seen[visitor_uuid] = time.time()
+                    assigned_uuids.add(visitor_uuid)
  
+                    if visitor_uuid in self.verified_face_uuids:
+                        self.tracks_with_face.add(track_id)
+                        
                     self.active_tracks[track_id] = visitor_uuid
                     if self.use_db:
                         if visitor_uuid in self.unique_visitors:
@@ -649,7 +693,11 @@ class UniquePersonCounter:
                     y2 = min(frame.shape[0], y2)
                     
                     visitor_uuid = self.active_tracks.get(track_id, "Unknown")
-                    display_id = self.uuid_to_stable_id.get(visitor_uuid, track_id)
+                    stable_num = self.uuid_to_stable_id.get(visitor_uuid)
+                    if track_id in self.tracks_with_face:
+                        display_id = f"V-{stable_num}" if stable_num is not None else f"V-T{track_id}"
+                    else:
+                        display_id = f"T-{track_id}"
                     
                     # State Machine: Green (Verified Face) vs Red (Tracking Only)
                     if track_id in self.tracks_with_face:
