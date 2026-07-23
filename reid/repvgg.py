@@ -51,6 +51,18 @@ class RepVGGReID:
             self.output_vstream_infos = self.hef.get_output_vstream_infos()
             logger.info(f"RepVGG ReID Model loaded successfully on Hailo. Input shape: {self.input_shape}")
             
+            # Activate network group and create InferVStreams once at startup
+            try:
+                self.activation_context = self.network_group.activate(self.network_group_params)
+                self.activation_context.__enter__()
+                self.infer_pipeline = InferVStreams(self.network_group, self.input_vstreams_params, self.output_vstreams_params)
+                self.infer_pipeline.__enter__()
+                self.active_permanently = True
+                logger.info("RepVGG ReID network group and InferVStreams activated permanently.")
+            except Exception as e:
+                logger.warning(f"Failed to activate RepVGG ReID network group permanently: {e}. Falling back to dynamic activation.")
+                self.active_permanently = False
+                
             self.is_mock = False
         except Exception as e:
             logger.error(f"Error loading RepVGG ReID HEF model: {e}. Falling back to simulation mode.")
@@ -71,11 +83,14 @@ class RepVGGReID:
             resized = cv2.resize(person_crop, (input_w, input_h))
             input_data = {self.input_name: np.expand_dims(resized, axis=0).astype(np.float32)}
             
-            # 2. Inference (dynamic activation)
-            from hailo_platform import InferVStreams
-            with self.network_group.activate(self.network_group_params):
-                with InferVStreams(self.network_group, self.input_vstreams_params, self.output_vstreams_params) as infer_pipeline:
-                    infer_results = infer_pipeline.infer(input_data)
+            # 2. Inference (dynamic or permanent activation)
+            if getattr(self, 'active_permanently', False):
+                infer_results = self.infer_pipeline.infer(input_data)
+            else:
+                from hailo_platform import InferVStreams
+                with self.network_group.activate(self.network_group_params):
+                    with InferVStreams(self.network_group, self.input_vstreams_params, self.output_vstreams_params) as infer_pipeline:
+                        infer_results = infer_pipeline.infer(input_data)
             
             # 3. Extract output vector
             out_name = self.output_vstream_infos[0].name
@@ -104,6 +119,12 @@ class RepVGGReID:
         return embedding
 
     def __del__(self):
+        if getattr(self, 'active_permanently', False):
+            try:
+                self.infer_pipeline.__exit__(None, None, None)
+                self.activation_context.__exit__(None, None, None)
+            except Exception:
+                pass
         if hasattr(self, 'exit_stack'):
             self.exit_stack.close()
         if hasattr(self, 'target') and (not self.device_manager or self.device_manager.device is None):
