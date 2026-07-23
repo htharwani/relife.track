@@ -178,6 +178,9 @@ class UniquePersonCounter:
         
         # Cached relative face bounding box coordinates (track_id: (rx1, ry1, rx2, ry2)) for smoothing/interpolation
         self.track_relative_face_bbox = {}
+        
+        # Track the number of face detection attempts made on each track_id to progressively throttle checks
+        self.face_detection_attempts = {}
 
         # Hydrate current counts and daily visitor UUIDs from database
         if self.use_db and self.db:
@@ -334,14 +337,23 @@ class UniquePersonCounter:
                             # Run detection frequently (every 2 frames) to confirm their face immediately
                             run_face_detection = ((self.frame_count + track_id) % 2 == 0)
                         else:
-                            # Run once every 5 frames to reduce NPU load
-                            run_face_detection = ((self.frame_count + track_id) % 5 == 0)
+                            # Run once every 5 frames initially, progressively throttling if no face is found
+                            attempts = self.face_detection_attempts.get(track_id, 0)
+                            if attempts < 15:
+                                run_face_detection = ((self.frame_count + track_id) % 5 == 0)
+                            elif attempts < 45:
+                                run_face_detection = ((self.frame_count + track_id) % 15 == 0)
+                            else:
+                                run_face_detection = ((self.frame_count + track_id) % 45 == 0)
                     
                     faces = []
                     is_valid_face = False
                     embedding = None
                     
                     if is_close_enough and run_face_detection:
+                        if visitor_uuid not in self.verified_face_uuids:
+                            self.face_detection_attempts[track_id] = self.face_detection_attempts.get(track_id, 0) + 1
+                            
                         y_threshold = int(frame.shape[0] * 0.55)
                         can_have_face = (y1 < y_threshold)
                         faces = self.scrfd.detect(person_crop, simulate=(self.simulate_face and can_have_face))
@@ -552,6 +564,7 @@ class UniquePersonCounter:
                     
                     # Throttle face detection for new tracks to once every 5 frames
                     run_face_detection = ((self.frame_count + track_id) % 5 == 0)
+                    self.face_detection_attempts[track_id] = 1 if run_face_detection else 0
                     
                     faces = []
                     is_valid_face = False
@@ -808,6 +821,7 @@ class UniquePersonCounter:
                 self.db_live_tracks_cache = {tid: val for tid, val in self.db_live_tracks_cache.items() if tid in active_ids}
                 self.smoothed_bboxes = {tid: box for tid, box in self.smoothed_bboxes.items() if tid in active_ids}
                 self.track_best_face_score = {tid: score for tid, score in self.track_best_face_score.items() if tid in active_ids}
+                self.face_detection_attempts = {tid: val for tid, val in self.face_detection_attempts.items() if tid in active_ids}
 
                 # Check if hour shifted and reset metrics if needed
                 self.check_hour_shift()
