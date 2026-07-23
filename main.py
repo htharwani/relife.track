@@ -493,8 +493,8 @@ class UniquePersonCounter:
                         self.uuid_to_stable_id[visitor_uuid] = self.next_display_id
                         self.next_display_id += 1
                         
-                    # Update ReID history periodically (every 15 frames distributed) or when face is valid
-                    if ((self.frame_count + track_id) % 15 == 0) or is_valid_face:
+                    # Update ReID history periodically (every 30 frames distributed)
+                    if (self.frame_count + track_id) % 30 == 0:
                         try:
                             raw_reid = self.reid.extract(person_crop)
                             reid_emb = normalize_embedding(raw_reid)
@@ -607,6 +607,7 @@ class UniquePersonCounter:
                             self.track_face_bbox.pop(track_id, None)
                         
                     visitor_uuid = None
+                    reid_emb = None
                     if is_close_enough:
                         try:
                             raw_reid = self.reid.extract(person_crop)
@@ -703,12 +704,15 @@ class UniquePersonCounter:
                             logger.info(f"Temporary visitor tracked (No Face): {visitor_uuid}")
                             
                         # Save initial ReID embedding for future recoveries
-                        try:
-                            raw_reid = self.reid.extract(person_crop)
-                            reid_emb = normalize_embedding(raw_reid)
+                        if reid_emb is not None:
                             self.reid_history[visitor_uuid] = reid_emb
-                        except Exception as e:
-                            logger.warning(f"Failed to extract initial ReID for track {track_id}: {e}")
+                        elif is_close_enough:
+                            try:
+                                raw_reid = self.reid.extract(person_crop)
+                                reid_emb = normalize_embedding(raw_reid)
+                                self.reid_history[visitor_uuid] = reid_emb
+                            except Exception as e:
+                                logger.warning(f"Failed to extract initial ReID for track {track_id}: {e}")
  
                     # Register display ID mapping
                     if visitor_uuid not in self.uuid_to_stable_id:
