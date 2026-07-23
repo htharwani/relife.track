@@ -49,17 +49,7 @@ class HailoYOLODetector:
         
         logger.info(f"YOLO Model loaded successfully on Hailo. Input shape: {self.input_shape}")
 
-        # Activate network group and create InferVStreams once at startup
-        try:
-            self.activation_context = self.network_group.activate(self.network_group_params)
-            self.activation_context.__enter__()
-            self.infer_pipeline = InferVStreams(self.network_group, self.input_vstreams_params, self.output_vstreams_params)
-            self.infer_pipeline.__enter__()
-            self.active_permanently = True
-            logger.info("YOLO network group and InferVStreams activated permanently.")
-        except Exception as e:
-            logger.warning(f"Failed to activate YOLO network group permanently: {e}. Falling back to dynamic activation.")
-            self.active_permanently = False
+
 
     def detect(self, frame):
         """
@@ -77,15 +67,12 @@ class HailoYOLODetector:
         # Ensure array is contiguous and formatted as expected by Hailo
         input_data = {self.input_name: np.expand_dims(resized, axis=0).astype(np.float32)}
         
-        # 2. Inference (dynamic or permanent activation)
+        # 2. Inference (dynamic activation)
         try:
-            if getattr(self, 'active_permanently', False):
-                infer_results = self.infer_pipeline.infer(input_data)
-            else:
-                from hailo_platform import InferVStreams
-                with self.network_group.activate(self.network_group_params):
-                    with InferVStreams(self.network_group, self.input_vstreams_params, self.output_vstreams_params) as infer_pipeline:
-                        infer_results = infer_pipeline.infer(input_data)
+            from hailo_platform import InferVStreams
+            with self.network_group.activate(self.network_group_params):
+                with InferVStreams(self.network_group, self.input_vstreams_params, self.output_vstreams_params) as infer_pipeline:
+                    infer_results = infer_pipeline.infer(input_data)
         except Exception as e:
             logger.error(f"YOLO Inference failed: {e}")
             return np.empty((0, 6))
@@ -134,12 +121,6 @@ class HailoYOLODetector:
         return np.array(boxes) if boxes else np.empty((0, 6))
 
     def __del__(self):
-        if getattr(self, 'active_permanently', False):
-            try:
-                self.infer_pipeline.__exit__(None, None, None)
-                self.activation_context.__exit__(None, None, None)
-            except Exception:
-                pass
         if hasattr(self, 'exit_stack'):
             self.exit_stack.close()
         if hasattr(self, 'target') and (not self.device_manager or self.device_manager.device is None):
