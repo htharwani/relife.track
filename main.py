@@ -195,6 +195,9 @@ class UniquePersonCounter:
         
         # Tracks that have already checked for ReID recovery to prevent repeated checks
         self.reid_recovered_tracks = set()
+        
+        # Track the last timestamp when each track_id was seen active
+        self.track_last_seen = {}
 
         # Hydrate current counts and daily visitor UUIDs from database
         if self.use_db and self.db:
@@ -771,16 +774,23 @@ class UniquePersonCounter:
                     # Sleep slightly if running headlessly to prevent high CPU utilization
                     time.sleep(0.01)
  
-                # Cleanup stale DB and memory tracking states
-                self.active_tracks = {tid: uuid for tid, uuid in self.active_tracks.items() if tid in active_ids}
-                self.tracks_with_face = {tid for tid in self.tracks_with_face if tid in active_ids}
-                self.track_face_bbox = {tid: bbox for tid, bbox in self.track_face_bbox.items() if tid in active_ids}
-                self.track_relative_face_bbox = {tid: bbox for tid, bbox in self.track_relative_face_bbox.items() if tid in active_ids}
-                self.db_live_tracks_cache = {tid: val for tid, val in self.db_live_tracks_cache.items() if tid in active_ids}
-                self.smoothed_bboxes = {tid: box for tid, box in self.smoothed_bboxes.items() if tid in active_ids}
-                self.track_best_face_score = {tid: score for tid, score in self.track_best_face_score.items() if tid in active_ids}
-                self.face_detection_attempts = {tid: val for tid, val in self.face_detection_attempts.items() if tid in active_ids}
-                self.reid_recovered_tracks = {tid for tid in self.reid_recovered_tracks if tid in active_ids}
+                # Cleanup stale DB and memory tracking states (Grace period of 10s to prevent duplicate registrations when tracker flickers)
+                now = time.time()
+                for tid in active_ids:
+                    self.track_last_seen[tid] = now
+                
+                alive_ids = {tid for tid, last_time in self.track_last_seen.items() if now - last_time <= 10.0}
+                
+                self.active_tracks = {tid: uuid for tid, uuid in self.active_tracks.items() if tid in alive_ids}
+                self.tracks_with_face = {tid for tid in self.tracks_with_face if tid in alive_ids}
+                self.track_face_bbox = {tid: bbox for tid, bbox in self.track_face_bbox.items() if tid in alive_ids}
+                self.track_relative_face_bbox = {tid: bbox for tid, bbox in self.track_relative_face_bbox.items() if tid in alive_ids}
+                self.db_live_tracks_cache = {tid: val for tid, val in self.db_live_tracks_cache.items() if tid in alive_ids}
+                self.smoothed_bboxes = {tid: box for tid, box in self.smoothed_bboxes.items() if tid in alive_ids}
+                self.track_best_face_score = {tid: score for tid, score in self.track_best_face_score.items() if tid in alive_ids}
+                self.face_detection_attempts = {tid: val for tid, val in self.face_detection_attempts.items() if tid in alive_ids}
+                self.reid_recovered_tracks = {tid for tid in self.reid_recovered_tracks if tid in alive_ids}
+                self.track_last_seen = {tid: val for tid, val in self.track_last_seen.items() if tid in alive_ids}
 
                 # Check if hour shifted and reset metrics if needed
                 self.check_hour_shift()
