@@ -98,10 +98,10 @@ class HailoYOLODetector:
                                         if score < self.conf_threshold:
                                             continue
                                             
-                                        x1 = int(xmin * w) if xmin <= 1.0 else int(xmin * (w / input_w))
-                                        y1 = int(ymin * h) if ymin <= 1.0 else int(ymin * (h / input_h))
-                                        x2 = int(xmax * w) if xmax <= 1.0 else int(xmax * (w / input_w))
-                                        y2 = int(ymax * h) if ymax <= 1.0 else int(ymax * (h / input_h))
+                                        x1 = int(xmin * w)
+                                        y1 = int(ymin * h)
+                                        x2 = int(xmax * w)
+                                        y2 = int(ymax * h)
                                         
                                         boxes.append([x1, y1, x2, y2, score, class_id])
                         
