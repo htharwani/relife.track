@@ -336,42 +336,6 @@ class UniquePersonCounter:
                     # Throttle face detection based on whether the track already has a verified face
                     visitor_uuid = self.active_tracks[track_id]
                     
-                    # Throttled ReID Body-Recovery for unverified tracks in Pass 1 (runs exactly once per track)
-                    if track_id not in self.tracks_with_face and track_id not in self.reid_recovered_tracks:
-                        if (self.frame_count + track_id) % 10 == 0 and is_close_enough:
-                            self.reid_recovered_tracks.add(track_id)
-                            try:
-                                raw_reid = self.reid.extract(person_crop)
-                                reid_emb = normalize_embedding(raw_reid)
-                                
-                                active_uuids = set(self.active_tracks.values())
-                                now_time = time.time()
-                                
-                                best_reid_uuid = None
-                                best_reid_score = -1.0
-                                for u, cached_emb in self.reid_history.items():
-                                    if u in active_uuids:
-                                        continue
-                                    if now_time - self.reid_last_seen.get(u, 0) > 15.0:
-                                        continue
-                                    score = np.dot(reid_emb, cached_emb)
-                                    if score > best_reid_score:
-                                        best_reid_score = score
-                                        best_reid_uuid = u
-                                        
-                                reid_thresh = self.config['pipeline'].get('reid_threshold', 0.65)
-                                if best_reid_score > reid_thresh:
-                                    if best_reid_uuid not in assigned_uuids:
-                                        visitor_uuid = best_reid_uuid
-                                        self.active_tracks[track_id] = visitor_uuid
-                                        self.reid_history[visitor_uuid] = reid_emb
-                                        logger.info(f"ReID Track Recovery for active track {track_id}: matched with UUID {str(visitor_uuid)[:8]} (Score: {best_reid_score:.4f})")
-                                        if visitor_uuid in self.verified_face_uuids:
-                                            self.tracks_with_face.add(track_id)
-                                            self.unique_visitors.add(visitor_uuid)
-                            except Exception as e:
-                                logger.warning(f"Pass 1 ReID recovery failed: {e}")
-                            
                     if track_id in self.tracks_with_face:
                         # Stop face detection completely once the face is verified/registered
                         run_face_detection = False
@@ -396,6 +360,7 @@ class UniquePersonCounter:
                     faces = []
                     is_valid_face = False
                     embedding = None
+                    reid_emb = None
                     
                     if is_close_enough and run_face_detection:
                         # Bounding box aspect ratio check to skip face NPU calls for non-frontal/profile shapes
@@ -456,6 +421,15 @@ class UniquePersonCounter:
                                     embedding = normalize_embedding(raw_embedding)
                                 except Exception as e:
                                     logger.warning(f"Failed to extract face embedding for Track {track_id}: {e}")
+                                    embedding = None
+                                
+                                # Extract ReID body embedding ONLY when face is visible
+                                try:
+                                    raw_reid = self.reid.extract(person_crop)
+                                    reid_emb = normalize_embedding(raw_reid)
+                                except Exception as e:
+                                    logger.warning(f"Failed to extract ReID embedding for Track {track_id}: {e}")
+                                    reid_emb = None
                                     
                     # If we did not run face detection or didn't find a valid face on this frame,
                     # interpolate the face bbox using cached relative coordinates
@@ -520,6 +494,8 @@ class UniquePersonCounter:
                             self.tracks_with_face.add(track_id)
                             self.verified_face_uuids.add(visitor_uuid)
                             self.unique_visitors.add(visitor_uuid)
+                            if reid_emb is not None:
+                                self.reid_history[visitor_uuid] = reid_emb
                         else:
                             # Track is already verified (green), but let's check if the face matches a different registered visitor.
                             # This corrects ReID recovery errors (false matches).
@@ -557,15 +533,6 @@ class UniquePersonCounter:
                     if visitor_uuid not in self.uuid_to_stable_id:
                         self.uuid_to_stable_id[visitor_uuid] = self.next_display_id
                         self.next_display_id += 1
-                        
-                    # Update ReID history periodically (every 30 frames distributed)
-                    if (self.frame_count + track_id) % 30 == 0:
-                        try:
-                            raw_reid = self.reid.extract(person_crop)
-                            reid_emb = normalize_embedding(raw_reid)
-                            self.reid_history[visitor_uuid] = reid_emb
-                        except Exception as e:
-                            logger.warning(f"Failed to update ReID history for track {track_id}: {e}")
                         
                     # Mark profile active now
                     self.reid_last_seen[visitor_uuid] = time.time()
@@ -707,8 +674,8 @@ class UniquePersonCounter:
                             self.db.insert_visitor(visitor_uuid, "body")
                         logger.info(f"Temporary visitor tracked (No Face): {visitor_uuid}")
                         
-                    # Save initial ReID embedding for future recoveries
-                    if is_close_enough:
+                    # Save initial ReID embedding for future recoveries (ONLY if face was detected and registered)
+                    if is_valid_face and is_close_enough:
                         try:
                             raw_reid = self.reid.extract(person_crop)
                             reid_emb = normalize_embedding(raw_reid)
