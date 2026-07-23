@@ -192,6 +192,9 @@ class UniquePersonCounter:
         
         # Track the number of face detection attempts made on each track_id to progressively throttle checks
         self.face_detection_attempts = {}
+        
+        # Tracks that have already checked for ReID recovery to prevent repeated checks
+        self.reid_recovered_tracks = set()
 
         # Hydrate current counts and daily visitor UUIDs from database
         if self.use_db and self.db:
@@ -333,39 +336,41 @@ class UniquePersonCounter:
                     # Throttle face detection based on whether the track already has a verified face
                     visitor_uuid = self.active_tracks[track_id]
                     
-                    # Throttled ReID Body-Recovery for unverified tracks in Pass 1
-                    if track_id not in self.tracks_with_face and (self.frame_count + track_id) % 10 == 0 and is_close_enough:
-                        try:
-                            raw_reid = self.reid.extract(person_crop)
-                            reid_emb = normalize_embedding(raw_reid)
-                            
-                            active_uuids = set(self.active_tracks.values())
-                            now_time = time.time()
-                            
-                            best_reid_uuid = None
-                            best_reid_score = -1.0
-                            for u, cached_emb in self.reid_history.items():
-                                if u in active_uuids:
-                                    continue
-                                if now_time - self.reid_last_seen.get(u, 0) > 15.0:
-                                    continue
-                                score = np.dot(reid_emb, cached_emb)
-                                if score > best_reid_score:
-                                    best_reid_score = score
-                                    best_reid_uuid = u
-                                    
-                            reid_thresh = self.config['pipeline'].get('reid_threshold', 0.65)
-                            if best_reid_score > reid_thresh:
-                                if best_reid_uuid not in assigned_uuids:
-                                    visitor_uuid = best_reid_uuid
-                                    self.active_tracks[track_id] = visitor_uuid
-                                    self.reid_history[visitor_uuid] = reid_emb
-                                    logger.info(f"ReID Track Recovery for active track {track_id}: matched with UUID {str(visitor_uuid)[:8]} (Score: {best_reid_score:.4f})")
-                                    if visitor_uuid in self.verified_face_uuids:
-                                        self.tracks_with_face.add(track_id)
-                                        self.unique_visitors.add(visitor_uuid)
-                        except Exception as e:
-                            logger.warning(f"Pass 1 ReID recovery failed: {e}")
+                    # Throttled ReID Body-Recovery for unverified tracks in Pass 1 (runs exactly once per track)
+                    if track_id not in self.tracks_with_face and track_id not in self.reid_recovered_tracks:
+                        if (self.frame_count + track_id) % 10 == 0 and is_close_enough:
+                            self.reid_recovered_tracks.add(track_id)
+                            try:
+                                raw_reid = self.reid.extract(person_crop)
+                                reid_emb = normalize_embedding(raw_reid)
+                                
+                                active_uuids = set(self.active_tracks.values())
+                                now_time = time.time()
+                                
+                                best_reid_uuid = None
+                                best_reid_score = -1.0
+                                for u, cached_emb in self.reid_history.items():
+                                    if u in active_uuids:
+                                        continue
+                                    if now_time - self.reid_last_seen.get(u, 0) > 15.0:
+                                        continue
+                                    score = np.dot(reid_emb, cached_emb)
+                                    if score > best_reid_score:
+                                        best_reid_score = score
+                                        best_reid_uuid = u
+                                        
+                                reid_thresh = self.config['pipeline'].get('reid_threshold', 0.65)
+                                if best_reid_score > reid_thresh:
+                                    if best_reid_uuid not in assigned_uuids:
+                                        visitor_uuid = best_reid_uuid
+                                        self.active_tracks[track_id] = visitor_uuid
+                                        self.reid_history[visitor_uuid] = reid_emb
+                                        logger.info(f"ReID Track Recovery for active track {track_id}: matched with UUID {str(visitor_uuid)[:8]} (Score: {best_reid_score:.4f})")
+                                        if visitor_uuid in self.verified_face_uuids:
+                                            self.tracks_with_face.add(track_id)
+                                            self.unique_visitors.add(visitor_uuid)
+                            except Exception as e:
+                                logger.warning(f"Pass 1 ReID recovery failed: {e}")
                             
                     if track_id in self.tracks_with_face:
                         if track_id not in self.track_relative_face_bbox:
@@ -783,8 +788,12 @@ class UniquePersonCounter:
                 sim_status = "ON" if self.simulate_face else "OFF (Backside)"
                 cv2.putText(frame, f"Face Sim (Press 'F'): {sim_status}", (20, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
  
-                # Encode the frame to JPEG for the HTTP MJPEG stream
-                ret_enc, jpeg_buffer = cv2.imencode('.jpg', frame)
+                # Encode the frame to JPEG for the HTTP MJPEG stream (resize and compress to save bandwidth)
+                stream_w = 640
+                stream_h = int(frame.shape[0] * (stream_w / frame.shape[1]))
+                stream_frame = cv2.resize(frame, (stream_w, stream_h), interpolation=cv2.INTER_AREA)
+                
+                ret_enc, jpeg_buffer = cv2.imencode('.jpg', stream_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 50])
                 if ret_enc:
                     global latest_frame
                     with self.condition:
@@ -814,6 +823,7 @@ class UniquePersonCounter:
                 self.smoothed_bboxes = {tid: box for tid, box in self.smoothed_bboxes.items() if tid in active_ids}
                 self.track_best_face_score = {tid: score for tid, score in self.track_best_face_score.items() if tid in active_ids}
                 self.face_detection_attempts = {tid: val for tid, val in self.face_detection_attempts.items() if tid in active_ids}
+                self.reid_recovered_tracks = {tid for tid in self.reid_recovered_tracks if tid in active_ids}
 
                 # Check if hour shifted and reset metrics if needed
                 self.check_hour_shift()
