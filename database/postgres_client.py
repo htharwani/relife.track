@@ -238,3 +238,42 @@ class PostgresClient:
                     cur.execute(insert_query, (camera_id, report_date, report_hour, total_in, total_out, peak_occupancy, float(avg_occupancy), now))
         except Exception as e:
             self._handle_db_error(e, "Failed to upsert hourly metrics")
+
+    def get_current_hourly_metrics(self, camera_id):
+        if not self.conn:
+            return 0, 0, 0
+        now = datetime.now()
+        report_date = now.date()
+        report_hour = now.hour
+        query = """
+        SELECT total_in, total_out, peak_occupancy FROM public.people_count_hourly 
+        WHERE camera_id = %s AND report_date = %s AND report_hour = %s;
+        """
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(query, (str(camera_id), report_date, report_hour))
+                row = cur.fetchone()
+                if row:
+                    return int(row[0]), int(row[1]), int(row[2])
+                return 0, 0, 0
+        except Exception as e:
+            self._handle_db_error(e, "Failed to fetch current hourly metrics")
+            return 0, 0, 0
+
+    def get_daily_visitor_uuids(self, camera_id):
+        if not self.conn:
+            return set()
+        now = datetime.now()
+        start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        query = """
+        SELECT DISTINCT visitor_uuid FROM visitor_events 
+        WHERE camera_id = %s AND timestamp >= %s;
+        """
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(query, (str(camera_id), start_of_day))
+                rows = cur.fetchall()
+                return {uuid.UUID(str(row[0])) if not isinstance(row[0], uuid.UUID) else row[0] for row in rows}
+        except Exception as e:
+            self._handle_db_error(e, "Failed to fetch daily visitor UUIDs")
+            return set()

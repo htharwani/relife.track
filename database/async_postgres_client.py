@@ -61,6 +61,12 @@ class AsyncPostgresClient:
     def upsert_people_count_hourly(self, camera_id, total_in, total_out, peak_occupancy, avg_occupancy):
         self.queue.put(("upsert_people_count_hourly", (camera_id, total_in, total_out, peak_occupancy, avg_occupancy), {}))
 
+    def get_current_hourly_metrics(self, camera_id):
+        return self.client.get_current_hourly_metrics(camera_id)
+
+    def get_daily_visitor_uuids(self, camera_id):
+        return self.client.get_daily_visitor_uuids(camera_id)
+
     def stop(self):
         """Stops the background worker thread gracefully."""
         self.queue.put(None)
