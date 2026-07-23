@@ -38,6 +38,8 @@ def get_iou(box1, box2):
     return float(inter_area) / union_area
 
 class StreamingHandler(BaseHTTPRequestHandler):
+    streamer = None
+
     def log_message(self, format, *args):
         # Suppress request logging to avoid terminal clutter
         return
@@ -47,24 +49,33 @@ class StreamingHandler(BaseHTTPRequestHandler):
         if self.path == '/stream':
             self.send_response(200)
             self.send_header('Age', '0')
-            self.send_header('Cache-Control', 'no-cache, private')
+            self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate, private')
             self.send_header('Pragma', 'no-cache')
+            self.send_header('Expires', '0')
+            self.send_header('X-Accel-Buffering', 'no')
             self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
             self.end_headers()
             try:
                 while True:
-                    with frame_lock:
-                        frame_data = latest_frame
+                    if self.streamer is not None:
+                        with self.streamer.condition:
+                            self.streamer.condition.wait()
+                            frame_data = latest_frame
+                    else:
+                        time.sleep(0.03)
+                        with frame_lock:
+                            frame_data = latest_frame
                     
-                    if frame_data is not None:
-                        self.wfile.write(b'--frame\r\n')
-                        self.send_header('Content-Type', 'image/jpeg')
-                        self.send_header('Content-Length', str(len(frame_data)))
-                        self.end_headers()
-                        self.wfile.write(frame_data)
-                        self.wfile.write(b'\r\n')
-                    
-                    time.sleep(0.03)  # ~30 FPS
+                    if frame_data is None:
+                        break
+                        
+                    self.wfile.write(b'--frame\r\n')
+                    self.send_header('Content-Type', 'image/jpeg')
+                    self.send_header('Content-Length', str(len(frame_data)))
+                    self.end_headers()
+                    self.wfile.write(frame_data)
+                    self.wfile.write(b'\r\n')
+                    self.wfile.flush()
             except Exception:
                 pass
         else:
@@ -198,10 +209,13 @@ class UniquePersonCounter:
                 logger.info(f"Hydrated {len(self.daily_logged_in_uuids)} unique visitor UUIDs seen since midnight today.")
             except Exception as e:
                 logger.error(f"Failed to hydrate startup state from DB: {e}")
+                
+        self.condition = threading.Condition()
 
     def run(self):
         # Start MJPEG HTTP server thread
         try:
+            StreamingHandler.streamer = self
             server = ThreadingHTTPServer(('0.0.0.0', self.stream_port), StreamingHandler)
             server_thread = threading.Thread(target=server.serve_forever, daemon=True)
             server_thread.start()
@@ -318,6 +332,41 @@ class UniquePersonCounter:
                     
                     # Throttle face detection based on whether the track already has a verified face
                     visitor_uuid = self.active_tracks[track_id]
+                    
+                    # Throttled ReID Body-Recovery for unverified tracks in Pass 1
+                    if track_id not in self.tracks_with_face and (self.frame_count + track_id) % 10 == 0 and is_close_enough:
+                        try:
+                            raw_reid = self.reid.extract(person_crop)
+                            reid_emb = normalize_embedding(raw_reid)
+                            
+                            active_uuids = set(self.active_tracks.values())
+                            now_time = time.time()
+                            
+                            best_reid_uuid = None
+                            best_reid_score = -1.0
+                            for u, cached_emb in self.reid_history.items():
+                                if u in active_uuids:
+                                    continue
+                                if now_time - self.reid_last_seen.get(u, 0) > 15.0:
+                                    continue
+                                score = np.dot(reid_emb, cached_emb)
+                                if score > best_reid_score:
+                                    best_reid_score = score
+                                    best_reid_uuid = u
+                                    
+                            reid_thresh = self.config['pipeline'].get('reid_threshold', 0.65)
+                            if best_reid_score > reid_thresh:
+                                if best_reid_uuid not in assigned_uuids:
+                                    visitor_uuid = best_reid_uuid
+                                    self.active_tracks[track_id] = visitor_uuid
+                                    self.reid_history[visitor_uuid] = reid_emb
+                                    logger.info(f"ReID Track Recovery for active track {track_id}: matched with UUID {str(visitor_uuid)[:8]} (Score: {best_reid_score:.4f})")
+                                    if visitor_uuid in self.verified_face_uuids:
+                                        self.tracks_with_face.add(track_id)
+                                        self.unique_visitors.add(visitor_uuid)
+                        except Exception as e:
+                            logger.warning(f"Pass 1 ReID recovery failed: {e}")
+                            
                     if track_id in self.tracks_with_face:
                         if track_id not in self.track_relative_face_bbox:
                             # Active face searching: if verified (e.g. recovered via ReID) but missing face box coordinates,
@@ -341,14 +390,23 @@ class UniquePersonCounter:
                             attempts = self.face_detection_attempts.get(track_id, 0)
                             if attempts < 15:
                                 run_face_detection = ((self.frame_count + track_id) % 5 == 0)
-                            elif attempts < 45:
+                            elif attempts < 30:
                                 run_face_detection = ((self.frame_count + track_id) % 15 == 0)
-                            else:
+                            elif attempts < 90:
                                 run_face_detection = ((self.frame_count + track_id) % 45 == 0)
+                            else:
+                                # Cap attempts: check very slowly (once every 150 frames) to minimize CPU usage
+                                run_face_detection = ((self.frame_count + track_id) % 150 == 0)
                     
                     faces = []
                     is_valid_face = False
                     embedding = None
+                    
+                    if is_close_enough and run_face_detection:
+                        # Bounding box aspect ratio check to skip face NPU calls for non-frontal/profile shapes
+                        aspect_ratio = person_h / person_w
+                        if aspect_ratio < 1.1 or aspect_ratio > 4.5:
+                            run_face_detection = False
                     
                     if is_close_enough and run_face_detection:
                         if visitor_uuid not in self.verified_face_uuids:
@@ -562,17 +620,25 @@ class UniquePersonCounter:
                     person_w = x2 - x1
                     is_close_enough = (person_h >= 80)
                     
-                    # Throttle face detection for new tracks to once every 5 frames
+                    # Throttle face detection for new tracks to once every 5 frames initially
                     run_face_detection = ((self.frame_count + track_id) % 5 == 0)
-                    self.face_detection_attempts[track_id] = 1 if run_face_detection else 0
-                    
+                    if run_face_detection:
+                        self.face_detection_attempts[track_id] = 1
+                    else:
+                        self.face_detection_attempts[track_id] = 0
+                        
                     faces = []
                     is_valid_face = False
                     if is_close_enough and run_face_detection:
-                        y_threshold = int(frame.shape[0] * 0.55)
-                        can_have_face = (y1 < y_threshold)
-                        faces = self.scrfd.detect(person_crop, simulate=(self.simulate_face and can_have_face))
+                        # Aspect ratio check
+                        aspect_ratio = person_h / person_w
+                        if 1.1 <= aspect_ratio <= 4.5:
+                            y_threshold = int(frame.shape[0] * 0.55)
+                            can_have_face = (y1 < y_threshold)
+                            faces = self.scrfd.detect(person_crop, simulate=(self.simulate_face and can_have_face))
                     
+                    # Decode face if detected
+                    embedding = None
                     if faces:
                         face_info = faces[0]
                         face_score = face_info[4]
@@ -580,26 +646,28 @@ class UniquePersonCounter:
                         fw = fx2 - fx1
                         fh = fy2 - fy1
                         
-                        # Only accept clear face detections (conf >= 0.55, size >= 24px)
                         if face_score >= 0.55 and fw >= 24 and fh >= 24:
-                            # Verify if it is a frontal/semi-frontal face by checking eye separation
                             landmarks = face_info[5] if len(face_info) > 5 else []
                             is_frontal = True
                             if len(landmarks) >= 2:
                                 lx, _ = landmarks[0][:2]
                                 rx, _ = landmarks[1][:2]
                                 eye_dist = abs(lx - rx)
-                                if eye_dist < fw * 0.15:  # Relaxed from 0.22 to 0.15
+                                if eye_dist < fw * 0.15:
                                     is_frontal = False
-                                    logger.info(f"Face ignored for Track {track_id}: rejected as profile/side-view (eye distance = {eye_dist:.1f} < {fw*0.15:.1f})")
-                                    
+                            
                             if is_frontal:
                                 is_valid_face = True
-                                logger.info(f"Valid face detected for Track {track_id}: score = {face_score:.2f}, size = {fw}x{fh}")
-                        else:
-                            logger.info(f"Face ignored for Track {track_id}: score = {face_score:.2f}, size = {fw}x{fh} (does not meet criteria)")
-                            
-                    if is_valid_face:
+                                logger.info(f"Valid face detected for new Track {track_id}: score = {face_score:.2f}, size = {fw}x{fh}")
+                                face_crop = person_crop[fy1:fy2, fx1:fx2]
+                                try:
+                                    raw_embedding = self.arcface.extract(face_crop)
+                                    embedding = normalize_embedding(raw_embedding)
+                                except Exception as e:
+                                    logger.warning(f"Failed to extract face embedding: {e}")
+                                    
+                    # If we found a valid face, set the face bounding box
+                    if is_valid_face and faces:
                         face_bbox = faces[0][:4]
                         fx1, fy1, fx2, fy2 = map(int, face_bbox)
                         gx1 = max(0, x1 + fx1)
@@ -609,142 +677,65 @@ class UniquePersonCounter:
                         self.track_face_bbox[track_id] = (gx1, gy1, gx2, gy2)
                         self.track_relative_face_bbox[track_id] = (fx1 / person_w, fy1 / person_h, fx2 / person_w, fy2 / person_h)
                     else:
-                        if track_id in self.track_relative_face_bbox:
-                            rn1, rn2, rn3, rn4 = self.track_relative_face_bbox[track_id]
-                            gx1 = max(0, x1 + int(rn1 * person_w))
-                            gy1 = max(0, y1 + int(rn2 * person_h))
-                            gx2 = min(frame.shape[1], x1 + int(rn3 * person_w))
-                            gy2 = min(frame.shape[0], y1 + int(rn4 * person_h))
-                            self.track_face_bbox[track_id] = (gx1, gy1, gx2, gy2)
-                        else:
-                            self.track_face_bbox.pop(track_id, None)
+                        self.track_face_bbox.pop(track_id, None)
                         
                     visitor_uuid = None
-                    reid_emb = None
+                    if is_valid_face and embedding is not None:
+                        self.tracks_with_face.add(track_id)
+                        self.track_best_face_score[track_id] = face_score
+                        
+                        threshold = self.config['pipeline']['faiss_similarity_threshold']
+                        matched_uuid, score = self.faiss.search(embedding, threshold=threshold)
+                        logger.info(f"New track FAISS search for track {track_id}: score = {score:.4f} (Threshold: {threshold})")
+                        
+                        if not matched_uuid or matched_uuid in assigned_uuids:
+                            visitor_uuid = uuid.uuid4()
+                            self.faiss.add_embedding(embedding, visitor_uuid)
+                            if self.use_db:
+                                self.db.insert_visitor(visitor_uuid, "face")
+                            logger.info(f"New face visitor registered permanently: {visitor_uuid}")
+                        else:
+                            visitor_uuid = matched_uuid
+                            logger.info(f"Existing face visitor recognized: {visitor_uuid} (Score: {score:.2f})")
+                            
+                            template_count = self.faiss.uuid_mapping.count(matched_uuid)
+                            if template_count < 3 and 0.55 <= score < 0.78:
+                                self.faiss.add_embedding(embedding, matched_uuid)
+                                logger.info(f"Added additional face template ({template_count+1}/3) for visitor UUID: {str(matched_uuid)[:8]}")
+                                
+                        self.unique_visitors.add(visitor_uuid)
+                        self.verified_face_uuids.add(visitor_uuid)
+                    else:
+                        # Temporary tracking only (Skip ReID recovery on frame 1)
+                        visitor_uuid = uuid.uuid4()
+                        if self.use_db:
+                            self.db.insert_visitor(visitor_uuid, "body")
+                        logger.info(f"Temporary visitor tracked (No Face): {visitor_uuid}")
+                        
+                    # Save initial ReID embedding for future recoveries
                     if is_close_enough:
                         try:
                             raw_reid = self.reid.extract(person_crop)
                             reid_emb = normalize_embedding(raw_reid)
-                            
-                            # Get currently active visitor UUIDs in the frame
-                            active_uuids = set(self.active_tracks.values())
-                            now_time = time.time()
-                            
-                            best_reid_uuid = None
-                            best_reid_score = -1.0
-                            for u, cached_emb in self.reid_history.items():
-                                if u in active_uuids:
-                                    continue  # Skip people who are already active in the frame
-                                
-                                # Skip profiles that were last seen more than 15 seconds ago
-                                if now_time - self.reid_last_seen.get(u, 0) > 15.0:
-                                    continue
-                                    
-                                score = np.dot(reid_emb, cached_emb)
-                                if score > best_reid_score:
-                                    best_reid_score = score
-                                    best_reid_uuid = u
-                                    
-                            reid_thresh = self.config['pipeline'].get('reid_threshold', 0.65)
-                            if best_reid_score > reid_thresh:
-                                # Double-assignment prevention for ReID
-                                if best_reid_uuid not in assigned_uuids:
-                                    visitor_uuid = best_reid_uuid
-                                    logger.info(f"ReID Track Recovery for track {track_id}: matched with UUID {str(visitor_uuid)[:8]} (Score: {best_reid_score:.4f}, Threshold: {reid_thresh})")
-                                    self.reid_history[visitor_uuid] = reid_emb  # update cache
-                                else:
-                                    logger.info(f"ReID match {str(best_reid_uuid)[:8]} ignored for track {track_id} because UUID is already active in frame.")
-                        except Exception as e:
-                            logger.warning(f"ReID recovery check failed for track {track_id}: {e}")
-                        
-                    # If not matched by ReID, process as truly new
-                    if not visitor_uuid:
-                        if is_valid_face:
-                            # Extract Face Embedding
-                            face_bbox = faces[0][:4]
-                            fx1, fy1, fx2, fy2 = map(int, face_bbox)
-                            face_crop = person_crop[fy1:fy2, fx1:fx2]
-                            face_score = faces[0][4]
-                            
-                            try:
-                                raw_embedding = self.arcface.extract(face_crop)
-                                embedding = normalize_embedding(raw_embedding)
-                            except Exception as e:
-                                logger.warning(f"Failed to extract face embedding: {e}")
-                                embedding = None
-                                
-                            if embedding is not None:
-                                self.tracks_with_face.add(track_id)
-                                self.track_best_face_score[track_id] = face_score
-                                
-                                # Search face in FAISS
-                                threshold = self.config['pipeline']['faiss_similarity_threshold']
-                                matched_uuid, score = self.faiss.search(embedding, threshold=threshold)
-                                logger.info(f"New track FAISS search for track {track_id}: score = {score:.4f} (Threshold: {threshold})")
-                                
-                                # Double-assignment prevention for matched face
-                                if not matched_uuid or matched_uuid in assigned_uuids:
-                                    if matched_uuid:
-                                        logger.info(f"FAISS match {str(matched_uuid)[:8]} ignored for track {track_id} because UUID is already active in frame.")
-                                    # Register new face permanently
-                                    visitor_uuid = uuid.uuid4()
-                                    self.faiss.add_embedding(embedding, visitor_uuid)
-                                    if self.use_db:
-                                        self.db.insert_visitor(visitor_uuid, "face")
-                                    logger.info(f"New face visitor registered permanently: {visitor_uuid}")
-                                else:
-                                    visitor_uuid = matched_uuid
-                                    logger.info(f"Existing face visitor recognized: {visitor_uuid} (Score: {score:.2f})")
-                                    
-                                    # Add as additional template if similarity is moderate and template count < 3
-                                    template_count = self.faiss.uuid_mapping.count(matched_uuid)
-                                    if template_count < 3 and 0.55 <= score < 0.78:
-                                        self.faiss.add_embedding(embedding, matched_uuid)
-                                        logger.info(f"Added additional face template ({template_count+1}/3) for visitor UUID: {str(matched_uuid)[:8]} (Similarity score: {score:.2f})")
-                                        
-                                self.unique_visitors.add(visitor_uuid)
-                                self.verified_face_uuids.add(visitor_uuid)
-                            else:
-                                # Fallback if embedding extraction fails
-                                visitor_uuid = uuid.uuid4()
-                                if self.use_db:
-                                    self.db.insert_visitor(visitor_uuid, "body")
-                        else:
-                            # Temporary tracking only (no valid face detected)
-                            visitor_uuid = uuid.uuid4()
-                            if self.use_db:
-                                self.db.insert_visitor(visitor_uuid, "body")
-                            logger.info(f"Temporary visitor tracked (No Face): {visitor_uuid}")
-                            
-                        # Save initial ReID embedding for future recoveries
-                        if reid_emb is not None:
                             self.reid_history[visitor_uuid] = reid_emb
-                        elif is_close_enough:
-                            try:
-                                raw_reid = self.reid.extract(person_crop)
-                                reid_emb = normalize_embedding(raw_reid)
-                                self.reid_history[visitor_uuid] = reid_emb
-                            except Exception as e:
-                                logger.warning(f"Failed to extract initial ReID for track {track_id}: {e}")
- 
+                        except Exception as e:
+                            logger.warning(f"Failed to extract initial ReID for new track {track_id}: {e}")
+                            
                     # Register display ID mapping
                     if visitor_uuid not in self.uuid_to_stable_id:
                         self.uuid_to_stable_id[visitor_uuid] = self.next_display_id
                         self.next_display_id += 1
- 
+                        
                     self.reid_last_seen[visitor_uuid] = time.time()
                     assigned_uuids.add(visitor_uuid)
- 
+                    
                     self.active_tracks[track_id] = visitor_uuid
                     if self.use_db:
                         if visitor_uuid in self.unique_visitors:
                             self.db.log_event(visitor_uuid, camera_id="imx500")
-                        
                         now = time.time()
-                        cached_uuid, last_live_time = self.db_live_tracks_cache.get(track_id, (None, 0.0))
-                        if cached_uuid != visitor_uuid or (now - last_live_time) >= 3.0:
-                            self.db.update_live_track(track_id, visitor_uuid)
-                            self.db_live_tracks_cache[track_id] = (visitor_uuid, now)
+                        self.db.update_live_track(track_id, visitor_uuid)
+                        self.db_live_tracks_cache[track_id] = (visitor_uuid, now)
 
                 # Visualization: Draw bounding boxes and IDs
                 for track in tracked_objects:
@@ -796,8 +787,9 @@ class UniquePersonCounter:
                 ret_enc, jpeg_buffer = cv2.imencode('.jpg', frame)
                 if ret_enc:
                     global latest_frame
-                    with frame_lock:
+                    with self.condition:
                         latest_frame = jpeg_buffer.tobytes()
+                        self.condition.notify_all()
  
                 # Show the video stream window (safely catch errors if running headlessly)
                 try:

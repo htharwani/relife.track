@@ -71,11 +71,29 @@ class SCRFDDetector:
         try:
             h_orig, w_orig = img_crop.shape[:2]
             
-            # 1. Preprocessing
+            # 1. Preprocessing with letterboxing to preserve aspect ratio
             input_h = self.input_shape[0]
             input_w = self.input_shape[1]
-            resized = cv2.resize(img_crop, (input_w, input_h))
-            input_data = {self.input_name: np.expand_dims(resized, axis=0).astype(np.float32)}
+            
+            # Calculate resize scale and padding values
+            r = min(input_w / w_orig, input_h / h_orig)
+            new_unpad = int(round(w_orig * r)), int(round(h_orig * r))
+            pad_x = (input_w - new_unpad[0]) // 2
+            pad_y = (input_h - new_unpad[1]) // 2
+            
+            if (w_orig, h_orig) != new_unpad:
+                resized = cv2.resize(img_crop, new_unpad, interpolation=cv2.INTER_LINEAR)
+            else:
+                resized = img_crop.copy()
+                
+            padded = cv2.copyMakeBorder(
+                resized,
+                pad_y, input_h - new_unpad[1] - pad_y,
+                pad_x, input_w - new_unpad[0] - pad_x,
+                cv2.BORDER_CONSTANT,
+                value=(114, 114, 114)
+            )
+            input_data = {self.input_name: np.expand_dims(padded, axis=0).astype(np.float32)}
             
             # 2. Inference (dynamic activation)
             from hailo_platform import InferVStreams
@@ -120,50 +138,63 @@ class SCRFDDetector:
                 bbox_map = out['bbox']
                 kps_map = out.get('kps', None)
                 
-                H, W, C = score_map.shape
-                num_anchors = C
+                # Apply sigmoid where scores are raw logits (vectorized)
+                scores = score_map.copy()
+                neg_mask = scores < 0
+                if np.any(neg_mask):
+                    scores[neg_mask] = 1.0 / (1.0 + np.exp(-scores[neg_mask]))
                 
-                for y in range(H):
-                    for x in range(W):
-                        for a in range(num_anchors):
-                            score = score_map[y, x, a]
-                            # Apply sigmoid if scores are raw logits
-                            if score < 0:
-                                score = 1.0 / (1.0 + np.exp(-score))
-                                
-                            if score < self.conf_threshold:
-                                continue
-                                
-                            idx = a * 4
-                            dist = bbox_map[y, x, idx:idx+4]
+                # Fast numpy filtering
+                y_indices, x_indices, a_indices = np.where(scores >= self.conf_threshold)
+                
+                if len(y_indices) == 0:
+                    continue
+                    
+                for y, x, a in zip(y_indices, x_indices, a_indices):
+                    score = scores[y, x, a]
+                    
+                    idx = a * 4
+                    dist = bbox_map[y, x, idx:idx+4]
+                    
+                    anchor_x = x * stride
+                    anchor_y = y * stride
+                    
+                    x1 = anchor_x - dist[0] * stride
+                    y1 = anchor_y - dist[1] * stride
+                    x2 = anchor_x + dist[2] * stride
+                    y2 = anchor_y + dist[3] * stride
+                    
+                    # Subtract padding and divide by scale ratio 'r'
+                    fx1 = (x1 - pad_x) / r
+                    fy1 = (y1 - pad_y) / r
+                    fx2 = (x2 - pad_x) / r
+                    fy2 = (y2 - pad_y) / r
+                    
+                    # Clip coordinates to original image crop boundaries
+                    fx1 = max(0, min(w_orig, fx1))
+                    fy1 = max(0, min(h_orig, fy1))
+                    fx2 = max(0, min(w_orig, fx2))
+                    fy2 = max(0, min(h_orig, fy2))
+                    
+                    landmarks = []
+                    if kps_map is not None:
+                        kps_idx = a * 10
+                        kps_dist = kps_map[y, x, kps_idx:kps_idx+10]
+                        for k in range(5):
+                            kp_x = anchor_x + kps_dist[k*2] * stride
+                            kp_y = anchor_y + kps_dist[k*2+1] * stride
                             
-                            anchor_x = x * stride
-                            anchor_y = y * stride
+                            kp_x_orig = (kp_x - pad_x) / r
+                            kp_y_orig = (kp_y - pad_y) / r
                             
-                            x1 = anchor_x - dist[0] * stride
-                            y1 = anchor_y - dist[1] * stride
-                            x2 = anchor_x + dist[2] * stride
-                            y2 = anchor_y + dist[3] * stride
+                            landmarks.append([
+                                max(0, min(w_orig, kp_x_orig)),
+                                max(0, min(h_orig, kp_y_orig)),
+                                0.99
+                            ])
                             
-                            scale_x = w_orig / input_w
-                            scale_y = h_orig / input_h
-                            
-                            fx1 = max(0, x1 * scale_x)
-                            fy1 = max(0, y1 * scale_y)
-                            fx2 = min(w_orig, x2 * scale_x)
-                            fy2 = min(h_orig, y2 * scale_y)
-                            
-                            landmarks = []
-                            if kps_map is not None:
-                                kps_idx = a * 10
-                                kps_dist = kps_map[y, x, kps_idx:kps_idx+10]
-                                for k in range(5):
-                                    kp_x = anchor_x + kps_dist[k*2] * stride
-                                    kp_y = anchor_y + kps_dist[k*2+1] * stride
-                                    landmarks.append([kp_x * scale_x, kp_y * scale_y, 0.99])
-                                    
-                            bboxes.append([fx1, fy1, fx2, fy2, score])
-                            kpss.append(landmarks)
+                    bboxes.append([fx1, fy1, fx2, fy2, score])
+                    kpss.append(landmarks)
                             
             if not bboxes:
                 return []
