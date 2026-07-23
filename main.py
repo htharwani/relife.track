@@ -642,7 +642,7 @@ class UniquePersonCounter:
                     if faces:
                         face_info = faces[0]
                         face_score = face_info[4]
-                        fx1, fy1, fx2, fy2 = face_info[:4]
+                        fx1, fy1, fx2, fy2 = map(int, face_info[:4])
                         fw = fx2 - fx1
                         fh = fy2 - fy1
                         
