@@ -373,18 +373,8 @@ class UniquePersonCounter:
                                 logger.warning(f"Pass 1 ReID recovery failed: {e}")
                             
                     if track_id in self.tracks_with_face:
-                        if track_id not in self.track_relative_face_bbox:
-                            # Active face searching: if verified (e.g. recovered via ReID) but missing face box coordinates,
-                            # run detection frequently (every 2 frames) until we capture a face and cache relative coordinates.
-                            run_face_detection = ((self.frame_count + track_id) % 2 == 0)
-                        else:
-                            template_count = self.faiss.uuid_mapping.count(visitor_uuid)
-                            if template_count < 3:
-                                # Run face detection very slowly (every 60 frames) to check for better templates
-                                run_face_detection = ((self.frame_count + track_id) % 60 == 0)
-                            else:
-                                # Stop face detection completely for this track once 3 templates are verified
-                                run_face_detection = False
+                        # Stop face detection completely once the face is verified/registered
+                        run_face_detection = False
                     else:
                         # For unverified tracks:
                         if visitor_uuid in self.verified_face_uuids:
@@ -470,7 +460,7 @@ class UniquePersonCounter:
                     # If we did not run face detection or didn't find a valid face on this frame,
                     # interpolate the face bbox using cached relative coordinates
                     if not is_valid_face:
-                        if track_id in self.track_relative_face_bbox:
+                        if track_id in self.track_relative_face_bbox and track_id not in self.tracks_with_face:
                             rn1, rn2, rn3, rn4 = self.track_relative_face_bbox[track_id]
                             gx1 = max(0, x1 + int(rn1 * person_w))
                             gy1 = max(0, y1 + int(rn2 * person_h))
@@ -770,8 +760,8 @@ class UniquePersonCounter:
                     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
                     cv2.putText(frame, label, (x1, max(0, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
                     
-                    # Draw face bounding box if detected in this frame
-                    if track_id in self.track_face_bbox:
+                    # Draw face bounding box if detected in this frame (and the track is not verified yet)
+                    if track_id in self.track_face_bbox and track_id not in self.tracks_with_face:
                         fx1, fy1, fx2, fy2 = self.track_face_bbox[track_id]
                         cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), (255, 255, 0), 2)  # Draw face box in Cyan/Yellow
                         cv2.putText(frame, "Face", (fx1, max(0, fy1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 0), 1)
