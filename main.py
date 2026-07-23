@@ -110,13 +110,13 @@ class UniquePersonCounter:
         self.track_face_bbox = {} # track_id: (x1, y1, x2, y2) global coordinates of face
         self.simulate_face = False # Toggle to simulate face visibility
         
-        # Hourly statistics
+        # Daily and Hourly statistics
         self.camera_id = self.config['camera'].get('id', 1)
         self.hourly_total_in = 0
         self.hourly_total_out = 0
         self.hourly_peak_occupancy = 0
         self.hourly_occupancy_samples = []
-        self.hourly_logged_in_uuids = set()
+        self.daily_logged_in_uuids = set()
         self.current_hour = datetime.now().hour
         self.current_date = datetime.now().date()
         self.last_db_sync_time = 0
@@ -178,6 +178,23 @@ class UniquePersonCounter:
         
         # Cached relative face bounding box coordinates (track_id: (rx1, ry1, rx2, ry2)) for smoothing/interpolation
         self.track_relative_face_bbox = {}
+
+        # Hydrate current counts and daily visitor UUIDs from database
+        if self.use_db and self.db:
+            try:
+                # 1. Hydrate hourly metrics (total_in, total_out, peak_occupancy)
+                db_in, db_out, db_peak = self.db.get_current_hourly_metrics(self.camera_id)
+                self.hourly_total_in = db_in
+                self.hourly_total_out = db_out
+                self.hourly_peak_occupancy = db_peak
+                logger.info(f"Hydrated current hourly metrics from DB: total_in={self.hourly_total_in}, total_out={self.hourly_total_out}, peak_occupancy={self.hourly_peak_occupancy}")
+                
+                # 2. Hydrate daily logged unique visitor UUIDs (since midnight)
+                db_daily_uuids = self.db.get_daily_visitor_uuids(self.camera_id)
+                self.daily_logged_in_uuids = db_daily_uuids
+                logger.info(f"Hydrated {len(self.daily_logged_in_uuids)} unique visitor UUIDs seen since midnight today.")
+            except Exception as e:
+                logger.error(f"Failed to hydrate startup state from DB: {e}")
 
     def run(self):
         # Start MJPEG HTTP server thread
@@ -397,7 +414,7 @@ class UniquePersonCounter:
                         if self.use_db:
                             self.db.insert_visitor(visitor_uuid, "body")
                         self.active_tracks[track_id] = visitor_uuid
-
+ 
                     # Process face verification and templates
                     if is_valid_face and embedding is not None:
                         thresh = self.config['pipeline']['faiss_similarity_threshold']
@@ -711,7 +728,7 @@ class UniquePersonCounter:
                         if cached_uuid != visitor_uuid or (now - last_live_time) >= 3.0:
                             self.db.update_live_track(track_id, visitor_uuid)
                             self.db_live_tracks_cache[track_id] = (visitor_uuid, now)
- 
+
                 # Visualization: Draw bounding boxes and IDs
                 for track in tracked_objects:
                     track_id = track.track_id
@@ -799,11 +816,17 @@ class UniquePersonCounter:
                 self.hourly_occupancy_samples.append(current_occ)
 
                 # Log IN count strictly for CONFIRMED unique visitors active in the current frame
+                new_visitor_detected = False
                 for track_id, u in self.active_tracks.items():
                     if track_id in self.tracks_with_face:
-                        if u not in self.hourly_logged_in_uuids:
+                        if u not in self.daily_logged_in_uuids:
                             self.hourly_total_in += 1
-                            self.hourly_logged_in_uuids.add(u)
+                            self.daily_logged_in_uuids.add(u)
+                            new_visitor_detected = True
+
+                # Real-time database update when counts change
+                if new_visitor_detected:
+                    self.sync_hourly_metrics()
 
                 # Sync hourly metrics and cleanup database live_tracks every 5 seconds
                 now_time = time.time()
@@ -818,15 +841,21 @@ class UniquePersonCounter:
 
     def check_hour_shift(self):
         now = datetime.now()
-        if now.hour != self.current_hour or now.date() != self.current_date:
+        hour_shifted = (now.hour != self.current_hour)
+        date_shifted = (now.date() != self.current_date)
+        
+        if hour_shifted or date_shifted:
             logger.info(f"Hour shifted from {self.current_hour} to {now.hour}. Resetting hourly metrics.")
             self.hourly_total_in = 0
             self.hourly_total_out = 0
             self.hourly_peak_occupancy = 0
             self.hourly_occupancy_samples = []
-            self.hourly_logged_in_uuids.clear()
             self.current_hour = now.hour
-            self.current_date = now.date()
+            
+            if date_shifted:
+                logger.info(f"Date shifted from {self.current_date} to {now.date()}. Clearing daily logged visitors.")
+                self.daily_logged_in_uuids.clear()
+                self.current_date = now.date()
 
     def sync_hourly_metrics(self):
         if not self.use_db or not self.db:
